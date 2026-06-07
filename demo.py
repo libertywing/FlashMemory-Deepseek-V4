@@ -126,7 +126,7 @@ def main():
         idx = keep_topk[b].nonzero(as_tuple=True)[0].tolist()
         print(f"    row {b}: kept chunk indices = {idx}")
 
-    print("\n[demo] done. ✅  forward + scoring + selection all ran.")
+    print("\n[demo] done -- forward + scoring + selection all ran.")
 
 
 if __name__ == "__main__":

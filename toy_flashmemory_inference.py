@@ -236,7 +236,7 @@ def main():
     B, N = args.batch, args.n_chunks
 
     # ── 1. Load retriever ──────────────────────────────────────────────────────
-    print(f"FlashMemory DS-V4 — toy sparse-decode loop")
+    print(f"FlashMemory DS-V4 -- toy sparse-decode loop")
     print(f"[load] {args.ckpt}")
     retriever = FlashMemoryRetriever.from_checkpoint(
         args.ckpt, device=device, max_position=args.max_position
@@ -298,7 +298,7 @@ def main():
     avg_keep = sum(keep_ratios) / max(len(keep_ratios), 1)
     print("-" * 60)
     print(f"[done] {args.steps} tokens, {cycle} cycles, "
-          f"avg keep/cycle: {avg_keep:.1%}  →  ~{1 - avg_keep:.0%} CSA KV dropped")
+          f"avg keep/cycle: {avg_keep:.1%}  =>  ~{1 - avg_keep:.0%} CSA KV dropped")
     print(f"[note] Dropped chunks are masked to -inf in attention (= KV not recalled to GPU).  "
           f"Production swap engine not included in this release.")
 
