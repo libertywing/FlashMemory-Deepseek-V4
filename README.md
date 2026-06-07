@@ -1,3 +1,21 @@
+---
+language: en
+license: mit
+tags:
+- deepseek-v4
+- retrieval
+- kv-cache
+- sparse-attention
+- compress-sparse-attention
+- long-context
+- flashmemory
+datasets:
+- ruler
+- longmemeval
+- longbench-v2
+- mrcr
+---
+
 # FlashMemory DS-V4 Retriever
 
 A standalone, dependency-light reference implementation of the **FlashMemory DS-V4
