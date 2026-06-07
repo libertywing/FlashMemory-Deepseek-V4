@@ -54,7 +54,8 @@ def make_mock_compressed_k(
 
 def main():
     ap = argparse.ArgumentParser(description="FlashMemory DS-V4 Retriever demo")
-    ap.add_argument("--ckpt", required=True, help="path to joint checkpoint (.pt)")
+    ap.add_argument("--ckpt", required=True,
+                help="path to retriever checkpoint (flashmemory_ds_v4.safetensors from HuggingFace, NOT a full DSv4 model)")
     ap.add_argument("--device", default="cpu", help="cpu or cuda (default: cpu)")
     ap.add_argument("--batch", type=int, default=2, help="number of decode tokens")
     ap.add_argument("--n-chunks", type=int, default=64, help="number of compressed-K chunks")

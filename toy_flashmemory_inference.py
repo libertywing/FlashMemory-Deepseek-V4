@@ -214,7 +214,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="Toy DeepSeek-V4-FlashMemory sparse-decode loop driven by the FlashMemory Retriever"
     )
-    ap.add_argument("--ckpt", required=True, help="path to the FlashMemory DS-V4 joint checkpoint (.pt)")
+    ap.add_argument("--ckpt", required=True,
+                    help="path to the retriever checkpoint (flashmemory_ds_v4.safetensors from HuggingFace, NOT a full DSv4 model)")
     ap.add_argument("--device", default="cpu", help="cpu or cuda (default: cpu)")
     ap.add_argument("--batch", type=int, default=1, help="number of parallel decode sequences")
     ap.add_argument("--n-chunks", type=int, default=256, help="number of CSA memory chunks (the long history)")
