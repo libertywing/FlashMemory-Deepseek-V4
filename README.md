@@ -200,3 +200,20 @@ in the serving layer — this is not part of the standalone release.
 ## License
 
 MIT
+
+---
+
+## Citation
+
+If you use FlashMemory in your research, please cite:
+
+```bibtex
+@article{wang2026flashmemory,
+  title   = {FlashMemory-DeepSeek-V4: Lightning Index Ultra-Long Context via Lookahead Sparse Attention},
+  author  = {Yan Wang and Qifan Zhang and Jiachen Yu and Tian Liang and Dongyang Ma and
+             Xiang Hu and Zibo Lin and Chunyang Li and Zhichao Wang and Jia Li and
+             Yujiu Yang and Haitao Mi and Dong Yu},
+  year    = {2026},
+  journal = {arXiv preprint arXiv:2606.09079},
+  url     = {https://huggingface.co/papers/2606.09079},
+}
