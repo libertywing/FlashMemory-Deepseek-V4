@@ -1,3 +1,15 @@
-torch>=2.1
-safetensors
-numpy
+# FlashMemory DS-V4 Retriever — runtime dependencies
+
+# ── Standalone retriever (retriever.py / demo.py / toy_flashmemory_inference.py) ──
+torch>=2.1            # float8_e4m3 tensor support (tested: 2.9.1+cu129)
+safetensors>=0.4      # checkpoint loading (tested: 0.7.0)
+numpy>=1.24           # (tested: 2.4.0)
+
+# ── Sglang serving integration ─────────────────────────────────────────────────
+# Install sglang from the included source:
+#     pip install -e sglang/python
+#
+# Additional runtime dependencies:
+#     pip install sgl_kernel>=0.3.21   # (match your CUDA / torch version)
+#     pip install tilelang==0.1.8
+#     pip install apache-tvm-ffi==0.1.9

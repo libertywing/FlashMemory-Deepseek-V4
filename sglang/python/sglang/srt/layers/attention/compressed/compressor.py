@@ -1,0 +1,379 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
+
+import torch
+
+from sglang.jit_kernel.deepseek_v4 import (
+    CompressorDecodePlan,
+    CompressorPrefillPlan,
+    compress_forward,
+    compress_fused_norm_rope_inplace,
+    triton_create_paged_compress_data,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+)
+from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+from sglang.srt.layers.attention.nsa.utils import (
+    assert_tensor_identical_across_cp_ranks,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.compressed.metadata import DeepseekV4Metadata
+    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.models.deepseek_v4 import Compressor, DeepseekRefRMSNorm
+
+
+class FusedCompressMetadata(NamedTuple):
+    write_loc: torch.Tensor
+    extra_data: Optional[torch.Tensor]
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan]
+
+    def copy_(self, other: FusedCompressMetadata) -> None:
+        from .metadata import maybe_copy_inplace
+
+        self.write_loc.copy_(other.write_loc)
+        maybe_copy_inplace(self.extra_data, src=other.extra_data)
+        self.plan.copy_(other.plan)
+
+
+class CompressorBackend:
+    def __init__(self):
+        super().__init__()
+        self.forward_metadata: DeepseekV4Metadata
+
+    def get_paged_compress_metadata(self, compress_ratio: int) -> FusedCompressMetadata:
+        attr_name = f"c{compress_ratio}_compress_metadata"
+        metadata = getattr(self.forward_metadata, attr_name)
+        assert isinstance(metadata, FusedCompressMetadata)
+        return metadata
+
+    def forward_compress(
+        self,
+        *,
+        kv_score_buffer: torch.Tensor,
+        kv_score_input: torch.Tensor,
+        ape: torch.Tensor,
+        head_dim: int,
+        norm: DeepseekRefRMSNorm,
+        freqs_cis_cache: torch.Tensor,
+        rotate: bool,
+        forward_batch: ForwardBatch,
+        compress_ratio: int,
+        is_paged: bool = False,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
+
+        assert compress_ratio == 4 or compress_ratio == 128
+        if is_paged:
+            metadata = self.get_paged_compress_metadata(compress_ratio)
+            coff = 2 if is_overlap_compress(compress_ratio) else 1
+            if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+                kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+            else:
+                last_dim = 2 * head_dim * coff
+                assert kv_score_buffer.shape[-1] == last_dim
+                kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+        else:
+            plan = make_compressor_plan(compress_ratio, forward_batch)
+            metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
+        indices, extra_data, plan = metadata
+
+        kv_compressed = compress_forward(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score_input,
+            ape=ape,
+            indices=indices,
+            plan=plan,
+            compress_ratio=compress_ratio,
+            head_dim=head_dim,
+            extra_data=extra_data,
+        )
+        compress_fused_norm_rope_inplace(
+            kv_compressed,
+            norm.weight,
+            norm.eps,
+            freqs_cis_cache,
+            plan,
+        )
+        return rotate_activation(kv_compressed) if rotate else kv_compressed
+
+    def forward_core_compressor(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        compressor: Compressor,
+    ) -> None:
+        if forward_batch.forward_mode.is_idle():
+            return
+        # PREP_IN_CG lazy upgrade: the concrete backend (DeepseekV4BackendRadix)
+        # owns this helper. MQALayer._forward_prepare calls us before
+        # attn_backend.forward(), so Raw -> Radix must happen here too
+        # (e.g. 1.6T layer 0 has compress_ratio=128 and needs cX_compress_metadata).
+        self._maybe_upgrade_forward_metadata()
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        if TYPE_CHECKING:
+            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+
+        new_compressed_kv = compressor(x, forward_batch)
+        if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
+            assert_tensor_identical_across_cp_ranks(
+                new_compressed_kv,
+                tag=f"compressor(ratio={compressor.ratio}) layer_id={layer_id}",
+                forward_batch=forward_batch,
+            )
+        core_metadata = self.forward_metadata.core_metadata
+        out_loc = (
+            core_metadata.c4_out_loc
+            if compressor.ratio == 4
+            else core_metadata.c128_out_loc
+        )
+        # ── Path-P: redirect c4 (ratio==4) attention-KV store away from the
+        # shrunk GPU pool BEFORE the fused/non-fused split. The engine needs a
+        # NopeFp8RopeBf16Pack, so we always take the quant+pack path here (the
+        # fused store would write the full-pool layout we are trying to avoid).
+        # Prefill history -> CPU mirror only. Decode new chunk -> mirror +
+        # reserved-slot GPU write (remapped). The indexer-K scoring buffer
+        # (forward_indexer_compressor) is NOT touched. c128 is unaffected.
+        _eng = getattr(token_to_kv_pool, "_swap_engine_p", None)
+        if _eng is not None and compressor.ratio == 4:
+            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
+            _, _clid, _ = token_to_kv_pool.layer_mapping[layer_id]
+            if forward_batch.forward_mode.is_decode():
+                # Phase-2 cuda-graph: when the resident-mask capturer is active, the eager
+                # store_decode (.tolist()/unique/sort/synchronize + per-step recall) is
+                # FORBIDDEN under graph capture. Instead store the decode chunk into its
+                # DETERMINISTIC decode-resident reserve cell (fixed-shape, no host sync) so
+                # it is readable from the next step (autoregressive). store_decode_to_reserve
+                # handles the seq%4!=0 (no-new-chunk) rows via a sink cell (fixed shape).
+                from sglang.srt.layers.attention.compressed.resident_mask_capturer import (
+                    get_resident_mask_capturer,
+                )
+                if get_resident_mask_capturer() is not None:
+                    _eng.store_decode_to_reserve(
+                        _clid, forward_batch.req_pool_indices, out_loc, pack
+                    )
+                else:
+                    _eng.store_decode(_clid, out_loc, pack)  # eager: mirror + in-step recall
+            else:
+                _eng.store_prefill_to_mirror(_clid, out_loc, pack)
+            return
+        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+            token_to_kv_pool.set_extra_key_buffer_fused(
+                layer_id=layer_id,
+                loc=out_loc,
+                cache_k=new_compressed_kv,
+            )
+        else:
+            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
+            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+
+    def forward_indexer_compressor(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        compressor: Compressor,
+    ) -> None:
+        assert is_overlap_compress(compressor.ratio)
+        # PREP_IN_CG lazy upgrade (see forward_core_compressor for rationale).
+        self._maybe_upgrade_forward_metadata()
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        if TYPE_CHECKING:
+            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+
+        new_compressed_kv = compressor(x, forward_batch)
+        if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
+            assert_tensor_identical_across_cp_ranks(
+                new_compressed_kv,
+                tag=f"indexer_compressor(ratio={compressor.ratio}) layer_id={layer_id}",
+                forward_batch=forward_batch,
+            )
+        # ── Path-I SELECTIVE (index-K offload): for an OFFLOAD compress-layer the GPU index-K
+        # pool is shrunk (full history lives in the CPU mirror + recalled pages in the engine
+        # reserve). The native store writes at the FULL-history logical c4_out_loc → OOB on the
+        # shrunk buffer, and nothing reads that buffer on the offload+score-resident path. So we
+        # SKIP the native store for offload layers and instead write the new decode chunk's
+        # index-K straight into the reserve, in-place inside its (force-resident) page's recall
+        # block, so page-block Level-2 scoring reads it (see store_index_decode_to_reserve). The
+        # retriever TARGET layers keep their full pool (not offloaded) → native store unchanged.
+        # OFF by default (env unset) → _eng.index_k_offload False → native path, byte-identical.
+        _eng = getattr(token_to_kv_pool, "_swap_engine_p", None)
+        if (_eng is not None and getattr(_eng, "index_k_offload", False)
+                and getattr(_eng, "index_reserve_buf", None) is not None):
+            _, _iclid, _ = token_to_kv_pool.layer_mapping[layer_id]
+            if (_iclid < len(_eng.index_reserve_buf)
+                    and _eng.index_reserve_buf[_iclid] is not None):
+                # OFFLOAD layer: write reserve (decode only; on D there is no index-K prefill —
+                # prefill history arrives via the PD transfer into the mirror). Skip native store.
+                if forward_batch.forward_mode.is_decode():
+                    _ik_fp8, _ik_scale = act_quant(new_compressed_kv)
+                    _eng.store_index_decode_to_reserve(
+                        _iclid,
+                        forward_batch.req_pool_indices,
+                        self.forward_metadata.core_metadata.c4_out_loc,
+                        _ik_fp8,
+                        _ik_scale,
+                    )
+                # prefill on D would be unusual (decode server); fall through to native store
+                # only if NOT decode (keeps any P-side / warmup prefill correct). For decode we
+                # have already stored to the reserve → return without the OOB native write.
+                if forward_batch.forward_mode.is_decode():
+                    return
+        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+            token_to_kv_pool.set_index_k_fused(
+                layer_id=layer_id,
+                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                cache_k=new_compressed_kv,
+            )
+        else:
+            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
+                new_compressed_kv
+            )
+            token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                index_k=new_compressed_kv_fp8,
+                index_k_scale=new_compressed_kv_scale,
+            )
+
+
+def is_overlap_compress(compress_ratio: int) -> bool:
+    return compress_ratio == 4
+
+
+def make_compressor_plan(
+    compress_ratio: Literal[4, 128],
+    forward_batch: ForwardBatch,
+) -> Union[CompressorDecodePlan, CompressorPrefillPlan]:
+    if forward_batch.forward_mode.is_decode():
+        seq_lens_32 = forward_batch.seq_lens.to(torch.int32)
+        return CompressorDecodePlan(compress_ratio, seq_lens_32)
+    if forward_batch.forward_mode.is_prefill():
+        assert not forward_batch.forward_mode.is_target_verify()
+        extend_lens_list = forward_batch.extend_seq_lens_cpu
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        assert extend_lens_list is not None and seq_lens_cpu is not None
+        return CompressorPrefillPlan.generate(
+            compress_ratio=compress_ratio,
+            num_q_tokens=sum(extend_lens_list),
+            seq_lens=seq_lens_cpu,
+            extend_lens=torch.tensor(extend_lens_list),
+            device=forward_batch.seq_lens.device,
+        )
+    elif forward_batch.forward_mode.is_target_verify():
+        raise NotImplementedError("target verify mode to be implemented")
+    else:
+        raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
+
+
+def create_paged_compressor_data(
+    compress_ratio: Literal[4, 128],
+    *,
+    is_prefill: bool,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_lens: Optional[torch.Tensor] = None,
+    seq_lens_cpu: Optional[List[int]] = None,
+    extend_lens_cpu: Optional[List[int]] = None,
+    use_prefill_cuda_graph: bool = False,
+    num_q_tokens: Optional[int] = None,
+) -> FusedCompressMetadata:
+    swa_page_size = token_to_kv_pool.swa_page_size
+    ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
+    # assert ring_size % compress_ratio == 0
+
+    def clip_down(positions: torch.Tensor) -> torch.Tensor:
+        return positions // compress_ratio * compress_ratio
+
+    def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
+        positions = positions.masked_fill(positions < 0, 0)
+        loc = req_to_token[req_pool_indices, positions]
+        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
+        swa_pages = swa_loc // swa_page_size
+        state_loc = swa_pages * ring_size + swa_loc % ring_size
+        return (state_loc // compress_ratio).to(torch.int32)
+
+    is_overlap = is_overlap_compress(compress_ratio)
+
+    if is_prefill:
+        assert extend_lens is not None
+        write_loc, extra_data = triton_create_paged_compress_data(
+            compress_ratio=compress_ratio,
+            is_overlap=is_overlap,
+            swa_page_size=swa_page_size,
+            ring_size=ring_size,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_lens,
+            req_to_token=req_to_token,
+            full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
+        )
+
+        plan_kwargs: dict
+        if seq_lens_cpu is None:
+            assert num_q_tokens is not None
+            plan_kwargs = dict(
+                num_q_tokens=num_q_tokens,
+                seq_lens=seq_lens,
+                extend_lens=extend_lens,
+            )
+        else:
+            assert extend_lens_cpu is not None
+            plan_kwargs = dict(
+                num_q_tokens=sum(extend_lens_cpu),
+                seq_lens=torch.tensor(seq_lens_cpu),
+                extend_lens=torch.tensor(extend_lens_cpu),
+            )
+        plan = CompressorPrefillPlan.generate(
+            compress_ratio=compress_ratio,
+            device=seq_lens.device,
+            use_cuda_graph=use_prefill_cuda_graph,
+            **plan_kwargs,
+        )
+        _maybe_dump_metadata_extras(
+            token_to_kv_pool=token_to_kv_pool,
+            compress_ratio=compress_ratio,
+            plan=plan,
+        )
+    else:
+        write_positions = clip_down(seq_lens - 1)
+        write_loc = get_raw_loc(write_positions)
+        if is_overlap:
+            write_overlap_loc = get_raw_loc(write_positions - compress_ratio)
+            extra_data = write_overlap_loc.view(-1, 1)
+        else:
+            extra_data = None
+        plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
+
+    return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
+
+
+def _maybe_dump_metadata_extras(
+    *,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    compress_ratio: int,
+    plan: CompressorPrefillPlan,
+) -> None:
+    from sglang.jit_kernel.deepseek_v4 import maybe_dump_compress_metadata_extras
+
+    try:
+        ratio_idx = list(token_to_kv_pool.compression_ratios).index(compress_ratio)
+        pool = token_to_kv_pool.compress_state_pools[ratio_idx]
+        kv = pool.kv_score_buffer.kv_score
+        shape, dtype = kv.shape, kv.dtype
+    except (AttributeError, ValueError, IndexError):
+        return
+    maybe_dump_compress_metadata_extras(
+        compress_ratio=compress_ratio,
+        kv_score_buffer_shape=shape,
+        kv_score_buffer_dtype=dtype,
+        plan_compress_plan=plan.compress_plan,
+        plan_write_plan=plan.write_plan,
+    )
