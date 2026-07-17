@@ -4,10 +4,20 @@ Memory-Indexer retriever for **DeepSeek-V4 Compressed-Sparse-Attention (CSA)** K
 Replaces the native Lightning Indexer with a lightweight trained retriever — instead of
 scoring the full history every decode step, it predicts which ~10–15% of chunks the next
 64 tokens will attend to. Only the selected chunks stay on GPU; the rest are offloaded to
-CPU. Downstream evaluation matches or beats the full-attention baseline while **raising
-concurrency 3.6× at 1M context**.
+CPU.
 
 **[Model weights on Hugging Face](https://huggingface.co/libertywing/FlashMemory-Deepseek-V4)**
+
+## Highlights
+
+![Performance](Figures/Performance.png)
+
+**FM-DS-V4 matches or exceeds DS-V4-Flash on long-context accuracy while cutting the serving
+cost dramatically.** On LongBench-v2 it is on par with or above the full-attention baseline at
+every length (S/M/L). At 1M context it shrinks GPU KV cache by **~90%** (3.73 → 0.37 GB) and drops
+per-decode-token compute from 118.9 to 35.4 GFLOP (**0.30×**), which together deliver **2.7×
+aggregate throughput** and raise the max concurrency ceiling from 11 to 40 (**3.6×**). The longer
+the context, the larger the advantage.
 
 ---
 
@@ -158,6 +168,23 @@ Dequant: `fp8_values.view(float8_e4m3).float() * scale`.
 
 ## Two-level recall algorithm
 
+![Architecture](Figures/Architecture.png)
+
+The figure shows the full pipeline. Black is the stock **DS-V4 CSA pipeline**; red is our
+**Memory Indexer** addition. Two indexers cooperate at two cadences:
+
+- **Level 1 — Memory Indexer (red, every `τ` steps).** Our trained retriever scores the full
+  history's compressed keys with its own query, and a **Threshold Selector** picks the
+  query-critical chunks. Their compressed KV entries are **recalled (loaded) from CPU to GPU**;
+  everything else stays offloaded on CPU. This produces the resident set once per cycle.
+- **Level 2 — Lightning Indexer (black, every step).** The native indexer scores the (now
+  resident) chunks and the **Top-k Selector** keeps top-`k`, which are concatenated with the
+  sliding-window entries and fed to the **Shared Key-Value Multi-Query Attention**.
+
+The **GPU / CPU** dividing line is the key to the memory savings: only the recalled query-critical
+KV entries and the compressed indexer keys live on GPU, while the bulk compressed KV cache sits on
+CPU and is pulled in on demand. Detailed step-by-step:
+
 ```
  ┌──────────┐  compress & store    ┌────────────────────────────┐
  │ PREFILL  │  historical K/V      │  CSA KV-cache (the memory) │
@@ -243,6 +270,19 @@ at `neg_ratio`. `verify.py` checks a trained checkpoint against stored logits (P
 Pretrained retriever weights are on Hugging Face
 ([libertywing/FlashMemory-Deepseek-V4](https://huggingface.co/libertywing/FlashMemory-Deepseek-V4));
 download `checkpoints/` into the repo root (default `top3_R930_joint.pt`, CSA layers 10/12/20).
+
+---
+
+## Results
+
+![Experiments](Figures/experiment.png)
+
+Across long-context benchmarks (LongBench-v2, LongMemEval, RULER), **FM-DS-V4 matches or exceeds
+the DS-V4-Flash full-attention baseline** while keeping only ~10–15% of the CSA KV cache on GPU
+(**~90% KV overhead reduction**). The two rightmost columns — **Recency-10%** (keep the newest 10%)
+and **Random-10%** (keep a random 10%) — are ablations that hold the *same* KV budget as ours: our
+learned retriever beats both by a wide margin, showing the gains come from **learned relevance**,
+not from a positional or budget artifact.
 
 ---
 
