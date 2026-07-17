@@ -109,10 +109,23 @@ class PrefillBootstrapQueue:
 
         if self.scheduler.tp_worker.is_hybrid_swa:
             # FIXME: current SWA allocation allocate full kv cache size in prefill
-            self.max_total_num_tokens = min(
-                self.max_total_num_tokens,
-                self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
-            )
+            #
+            # DSv4 EXCEPTION (2026-07-16): DeepseekV4 uses COMPRESSED-attention SWA whose
+            # per-request SWA KV is window-bounded (window=128, slots recycle as the window
+            # slides) — the prefill does NOT need swa_size >= full prompt length. Clamping
+            # the prompt-length ceiling to swa_max_total_num_tokens here wrongly rejects any
+            # prompt longer than the swa pool (e.g. "exceeds 655360" on a 702K-token doc),
+            # forcing a swa-pool inflation hack that steals from the c4 pool. Single-node
+            # (tp_worker.max_req_len) never applies this clamp — it bounds by the FULL pool.
+            # So for is_swa_with_compressed_attention models, skip the clamp and keep the
+            # full-pool ceiling, matching single-node behavior. Other hybrid-SWA models
+            # (non-compressed, e.g. MiMoV2) keep the conservative clamp unchanged.
+            _mc = self.scheduler.tp_worker.model_runner.model_config
+            if not getattr(_mc, "is_swa_with_compressed_attention", False):
+                self.max_total_num_tokens = min(
+                    self.max_total_num_tokens,
+                    self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
+                )
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)

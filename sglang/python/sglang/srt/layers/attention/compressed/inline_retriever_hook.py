@@ -71,6 +71,11 @@ class InlineRetrieverHook:
         # (else attention reads cells that were never recalled). 0 = no cap (rely on
         # reserve being large enough); >0 = hard cap, drop lowest-score non-recent chunks.
         self.max_resident = int(os.environ.get("SGLANG_RETRIEVER_MAX_RESIDENT", "0"))
+        # STICKY: once a chunk has been recalled (in any past cycle), keep it resident
+        # forever (union the new keep-mask with the committed one). Default off = the
+        # original per-cycle-recompute behaviour (a chunk with sigmoid<thresh this cycle
+        # is evicted). On = a recalled chunk never gets masked out again.
+        self.sticky = os.environ.get("SGLANG_RETRIEVER_STICKY", "0") == "1"
 
         # Load joint ckpt once; build one _TrainedScorer per target layer.
         shared_state = torch.load(ckpt, map_location="cuda", weights_only=True)
@@ -87,7 +92,7 @@ class InlineRetrieverHook:
             f"[InlineRetriever] init (TWO-LEVEL: resident_set constrains all 21 c4 layers): "
             f"ckpt={ckpt} target_layers={self.target_layers} thresh={self.thresh} "
             f"interval={self.interval} last_keep={self.last_keep} first_keep={self.first_keep} "
-            f"ensemble={self.ensemble_mode} max_resident={self.max_resident}"
+            f"ensemble={self.ensemble_mode} max_resident={self.max_resident} sticky={self.sticky}"
         )
         self.first_target = self.target_layers[0]
         self.last_target = self.target_layers[-1]
@@ -201,7 +206,20 @@ class InlineRetrieverHook:
                 if is_last and all(l in entry["partial"] for l in self.target_layers) \
                         and entry["pend_seq"] == n_blk:
                     new_mask = self._finalize_resident(entry["partial"], n_blk, device, ri)
+                    # STICKY: union with the previously committed set so a chunk that
+                    # was recalled in any past cycle stays resident (never re-evicted).
+                    if self.sticky and entry["active"] is not None:
+                        old = entry["active"]
+                        w = min(old.shape[0], new_mask.shape[0])
+                        new_mask[:w] |= old[:w]
                     entry["active"] = new_mask          # commit (double-buffer swap)
+                    # Cumulative resident count (post-union). In sticky mode this only
+                    # grows; logs the accumulated GPU-resident chunk count + ratio.
+                    _ncum = int(new_mask.sum().item())
+                    logger.info(
+                        f"[InlineRetriever] CUM req={ri} c4_seq={n_blk} "
+                        f"resident_cum={_ncum} ({_ncum/max(n_blk,1):.1%}) sticky={self.sticky}"
+                    )
                     entry["active_seq"] = n_blk
                     entry["partial"] = {}
                     entry["pend_step"] = -10**9

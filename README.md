@@ -16,11 +16,11 @@ concurrency 3.6× at 1M context**.
 ```
 FlashMemory-Deepseek-V4/
 ├── sglang/                     # Full modified sglang source (editable install)
-├── start_server.sh             # Mode A: single-machine score-masking
-├── high_concurrency/           # Mode B: PD-disaggregated high-concurrency
-│   ├── launch_decode.sh        #   D (decode) server — all offload/recall here
-│   ├── launch_prefill.sh       #   P (prefill) server
-│   └── launch_router.sh        #   router (mini load-balancer)
+├── launch_decode.sh            # D (decode) server — all offload/recall here
+├── launch_prefill.sh           # P (prefill) server
+├── launch_router.sh            # router (mini load-balancer)
+├── data_generation/            # Stage-1: dump training data from a DSv4 server
+├── training/                   # Train the Memory-Indexer retriever
 ├── TECHNICAL_REPORT_en.md      # English technical report
 ├── TECHNICAL_REPORT_zh.md      # Chinese technical report
 └── requirements.txt
@@ -28,32 +28,17 @@ FlashMemory-Deepseek-V4/
 
 ---
 
-## Quick start (Mode A — single-machine score-masking)
+## Quick start (PD-disaggregated high-concurrency)
 
-The simplest way to run: a single sglang server with the retriever hook. All KV stays
-on GPU; the retriever masks non-selected chunks to `-inf` each decode cycle.
+Three servers: **P** (prefill), **D** (decode — all offload/recall), **router**
+(mini load-balancer). Clients connect only to the router at `http://<router>:31503/v1/chat/completions`.
 
 ```bash
 pip install -e sglang/python
 # Also requires sgl_kernel: pip install sgl_kernel==0.3.21
 
 # Download checkpoints from HuggingFace into checkpoints/
-MODEL=/path/to/ds_fp8 bash start_server.sh   # default TP=4, port 30000
 ```
-
-Look for `[_TrainedScorer] extracted l10/l12/l20` and `[InlineRetriever] resident#N`
-in the logs to confirm the retriever is active.
-
-Configurable via environment variables (see `start_server.sh` header):
-`MODEL` / `CKPT` / `LAYERS` / `PORT` / `TP` / `THRESH` / `INTERVAL` /
-`FIRST_KEEP` / `LAST_KEEP` / `ENSEMBLE_MODE`.
-
----
-
-## Production (Mode B — PD-disaggregated high-concurrency)
-
-Three servers: **P** (prefill), **D** (decode — all offload/recall), **router**
-(mini load-balancer). Clients connect only to the router at `http://<router>:31503/v1/chat/completions`.
 
 Key optimizations (all env-gated; gate-off = exact baseline DeepSeek-V4 behavior):
 
@@ -70,8 +55,6 @@ Key optimizations (all env-gated; gate-off = exact baseline DeepSeek-V4 behavior
 **Startup** (order: D first, then P, then router):
 
 ```bash
-cd high_concurrency
-
 # 1) D (decode) — on D machine GPU 0–7. 512K config example:
 TGT_CONC=60 TGT_CTX=524288 CTX_LEN=1100000 bash launch_decode.sh
 
@@ -82,15 +65,33 @@ CTX_LEN=1100000 SWA_RATIO=0.1 HOST=<P_IP> bash launch_prefill.sh
 PREFILL_IP=<P_IP> DECODE_IP=<D_IP> bash launch_router.sh
 ```
 
-**Reference performance (8×H20 TP8, cross-machine PD, vs baseline standard DSv4):**
+**Reference performance (8×H20 TP8, cross-machine PD, vs baseline standard DSv4; steady-state aggregate decode throughput):**
 
-| Context | Ours concurrent / throughput | Baseline concurrent / throughput | Gain concurrent | Gain throughput |
-|---------|------------------------------|----------------------------------|-----------------|-----------------|
-| 256K | 60 / ~1663 tok/s | 47 / ~1584 tok/s | 1.3× | 1.05× |
-| 512K | 60 / ~1535 tok/s | 25 / ~1028 tok/s | 2.4× | 1.49× |
-| 1M | 40 / ~1183 tok/s | 11 / ~455 tok/s | 3.6× | 2.60× |
+| Context | KMAX | Ours concurrent / throughput | Baseline concurrent / throughput | Gain concurrent | Gain throughput |
+|---------|------|------------------------------|----------------------------------|-----------------|-----------------|
+| 256K | 96 | 76 / ~2759 tok/s | 47 / ~1584 tok/s | 1.6× | 1.7× |
+| 512K | 192 | 60 / ~2008 tok/s | 25 / ~1028 tok/s | 2.4× | 2.0× |
+| 1M | 384 | 30 / ~1266 tok/s | 11 / ~455 tok/s | 2.7× | 2.8× |
 
-Longer context → larger offload advantage (baseline c4 KV per-request grows faster).
+`KMAX` (densest pages recalled per request) scales with context to hold ~10% recall coverage
+(256K→96 / 512K→192 / 1M→384 pages). Larger KMAX = fuller recall (higher quality) but moves more
+pages per recall (lower throughput). At the smaller KMAX=96, 1M reaches ~1537 tok/s (concurrency 40).
+Longer context → larger offload advantage. The 1M concurrency ceiling (~40) is bounded by host DRAM
+(CPU mirror per request ∝ context), not GPU memory or transfer.
+
+### Per-decode-token FLOPs (whole model)
+
+The constant work (MoE + MLA + compressors + indexer q-proj + LM head, **26.6 GFLOP**) is identical
+for baseline and ours. Only the indexer scoring differs: baseline scores the full history `O(context)`,
+ours scores only the resident set (`KMAX × 64` chunks, ~10% of history). Whole-model per-token FLOPs:
+
+| Context | KMAX | Baseline | Ours | Ours / Baseline | Saved |
+|---------|------|----------|------|-----------------|-------|
+| 256K | 96  | 50.8 GFLOP | 28.8 GFLOP | 0.57× | 43.3% |
+| 512K | 192 | 73.5 GFLOP | 31.0 GFLOP | 0.42× | 57.8% |
+| 1M   | 384 | 118.9 GFLOP | 35.4 GFLOP | 0.30× | 70.2% |
+
+Ours saves the **scoring**, not the attend (both do top-512). Longer context → more saved.
 
 ---
 
@@ -194,32 +195,54 @@ Dequant: `fp8_values.view(float8_e4m3).float() * scale`.
 
 ---
 
-## Downstream evaluation
+## Data
 
-FlashMemory DS-V4 matches or beats the full-attention baseline on reasoning-heavy
-long-context tasks while keeping only **~10–15% of CSA KV cache** on-device:
+Training data is dumped from a DeepSeek-V4 server: for every decode token it records the hidden
+state + compressed-K + golden labels (which CSA chunks the next 64 tokens attend to), written as
+`doc_*.pkl`. A dump-dedicated sglang server (native DSv4, `--disable-cuda-graph`) drives this.
 
-| Task | Context | vs. Full-Attn | KV Saved |
-|------|---------|:---:|------|
-| RULER (64k–512k) | 64K–512K | −1 ~ +2 pp | ~80–90% |
-| LongMemEval-s | 125K | ±1 pp | ~86% |
-| LongMemEval-m | 500K | ±1 pp | ~91% |
-| LongBench V2 | 46K–493K | +1 ~ +2 pp | ~73–90% |
-| MRCR (needle) | 274K | needs fallback | ~86% |
+```bash
+# 1) Start the dump server (the script unsets accel env + forces --disable-cuda-graph)
+MODEL=/path/to/ds_fp8 TP=8 PORT=30000 bash data_generation/start_dump_server.sh
 
-Precise needle-retrieval tasks (MRCR) require an additional **threshold-fallback**
-in the serving layer — this is supported in the sglang integration.
+# 2) Drive it to produce data (absolute --output-dir required; example input has 10 docs)
+MODEL_PATH=/path/to/ds_fp8 SGLANG_SERVER_URL=http://127.0.0.1:30000/v1 \
+python3 data_generation/run_dump_training_data.py \
+  --input data_generation/example_data/creative_writing_multiturn_filtered.subset10.jsonl \
+  --output-dir /ABSOLUTE/path/to/generated_data \
+  --start-idx 0 --end-idx 10 --thinking --topp 0.6 --min-layers 3 \
+  --concurrency 4 --batch-size 10
+```
+
+Each `doc_*.pkl` holds `hidden_layer_{L}` [T,4096] bf16, `compk_layer_{L}` [N,132] uint8, and
+CSR-format golden labels (`label_indices` / `label_scores` / `label_pointers`) — exactly the format
+the trainer expects. Input is JSONL (one `prompt` per line; see `data_generation/README.md` for the
+format and the two-pass dump details).
 
 ---
 
-## Checkpoints
+## Training
 
-Trained retriever weights are on Hugging Face:
-**[libertywing/FlashMemory-Deepseek-V4](https://huggingface.co/libertywing/FlashMemory-Deepseek-V4)**
+Point a `DATA_CONFIGS` entry (see the `smoke` template in `training/train.py`) at your generated
+data directory, then train. The retriever is a joint checkpoint over CSA layers 6/8/10/12/14/16/18/20.
 
-Download `checkpoints/` into the repo root. The default checkpoint is
-`top3_R930_joint.pt` (3-layer joint, CSA layers 10/12/20). Other options:
-`top1_R932` / `top2_R935` with joint + per-layer variants.
+```bash
+cd training
+
+# single GPU
+python3 train.py --joint-layers 6,8,10,12,14,16,18,20 --data-config smoke \
+  --n-heads 128 --q-lora-rank 2048 --lr 1e-4 --focal-loss --neg-ratio 3 \
+  --epochs 3 --batch-size 64 --bf16 --num-workers 0 --output-dir ./ckpts
+
+# or multi-GPU DDP (see train_ddp.sh)
+bash train_ddp.sh ddp 4 0,1,2,3
+```
+
+Labels: `label_interval=64`; positives = union of golden chunks over `[t, t+63]`, negatives sampled
+at `neg_ratio`. `verify.py` checks a trained checkpoint against stored logits (Pearson ≥ 0.95).
+Pretrained retriever weights are on Hugging Face
+([libertywing/FlashMemory-Deepseek-V4](https://huggingface.co/libertywing/FlashMemory-Deepseek-V4));
+download `checkpoints/` into the repo root (default `top3_R930_joint.pt`, CSA layers 10/12/20).
 
 ---
 
@@ -227,13 +250,14 @@ Download `checkpoints/` into the repo root. The default checkpoint is
 
 | File | Purpose |
 |------|---------|
-| `sglang/python/sglang/srt/layers/attention/compressed/retriever_hook_impl.py` | `_TrainedScorer` + `MultiRetrieverHook` (scoring + mask) |
-| `sglang/python/sglang/srt/layers/attention/compressed/inline_retriever_hook.py` | Mode A eager inline retriever hook |
-| `sglang/python/sglang/srt/layers/attention/compressed/resident_mask_capturer.py` | Mode B cuda-graph two-level recall (Level 1 side-band + Level 2 in-graph mask) |
+| `sglang/python/sglang/srt/layers/attention/compressed/retriever_hook_impl.py` | `_TrainedScorer` + `MultiRetrieverHook` (scoring) |
+| `sglang/python/sglang/srt/layers/attention/compressed/inline_retriever_hook.py` | `InlineRetrieverHook` — trained scorer reused by the Level-1 side-band |
+| `sglang/python/sglang/srt/layers/attention/compressed/resident_mask_capturer.py` | cuda-graph two-level recall (Level 1 side-band + Level 2 in-graph mask) |
 | `sglang/python/sglang/srt/layers/attention/compressed/swap_engine_p.py` | Path-P / Path-I KV offload engine (CPU mirror + LRU recall) |
 | `sglang/python/sglang/srt/models/deepseek_v4.py` | `_make_score_hook` — wires retriever into DSv4 decode |
-| `start_server.sh` | Mode A launch script |
-| `high_concurrency/launch_*.sh` | Mode B PD-disaggregation launch scripts |
+| `launch_{decode,prefill,router}.sh` | PD-disaggregation launch scripts |
+| `data_generation/` | Stage-1: dump `(hidden, compressed-K, golden labels)` from a DSv4 server |
+| `training/` | Train the Memory-Indexer retriever on dumped data |
 
 ---
 

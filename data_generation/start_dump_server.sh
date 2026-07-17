@@ -2,12 +2,9 @@
 # =============================================================================
 # start_dump_server.sh — 启动 sglang server, 用于「生产 retriever 训练数据」(Stage-1 dump)
 #
-# 与 start_server.sh 的区别:
-#   start_server.sh  = Stage-2「推理验证」: 用训练好的 retriever ckpt inline 打分 + mask
-#                      (SGLANG_RETRIEVER_INLINE=1)。
-#   本脚本           = Stage-1「数据生产」: 走 deepseek_v4.py 的文件协议 tracker
-#                      (pass1_dump_training)，把 hidden / compressed-K / golden-label
-#                      dump 成 pkl，供离线训练 retriever 用。
+# 本脚本 = 数据生产模式: 走 deepseek_v4.py 的文件协议 tracker (pass1_dump_training),
+#          把 hidden / compressed-K / golden-label dump 成 pkl, 供离线训练 retriever 用
+#          (供 training/ 消费)。它加载原生 DeepSeek-V4, 不做 offload / 推理选择。
 #
 # ★ dump hook 生效的两个硬门槛 (见 indexer.py:_forward_c4_indexer 里
 #   `if _rmc is None and not get_is_capture_mode(): ... c4_indexer.score_hook(...)`):
@@ -16,8 +13,8 @@
 #     2) not cuda-graph capture  → 必须 --disable-cuda-graph (否则 decode 被 graph 捕获,
 #                                   hook 的 Python side-effect 全部不执行 → 空目录)
 #
-# ★ 还有一条来自 deepseek_v4.py:_make_score_hook: 若 SGLANG_RETRIEVER_INLINE=1,
-#   会在到达 dump 逻辑之前就 return inline hook, dump 永远不触发。所以这里显式 unset。
+# ★ 数据生产走 dump 路径, 不走推理选择路径。为防环境里残留的加速/inline env 关掉
+#   dump hook, 下面显式 unset 它们 (SGLANG_PATHP_CUDAGRAPH / SGLANG_RETRIEVER_INLINE)。
 #
 # 起服务后自检:
 #   rm -f /tmp/debug_rids.txt ; (发一条推理) ; cat /tmp/debug_rids.txt
@@ -53,7 +50,7 @@ unset SGLANG_PATHP_PAGE_RECALL           || true
 export no_proxy="localhost,127.0.0.1,0.0.0.0,::1,${no_proxy:-}"
 export NO_PROXY="$no_proxy"
 
-# ── DeepSeek-V4 模型运行模式 (CSA + MoE), 与 start_server.sh 一致, 加载权重必需 ──
+# ── DeepSeek-V4 模型运行模式 (CSA + MoE, FP4 experts), 加载权重必需 ──
 export SGLANG_DSV4_MODE=2604
 export SGLANG_DSV4_2604_SUBMODE=2604B
 export SGLANG_DSV4_FP4_EXPERTS=1

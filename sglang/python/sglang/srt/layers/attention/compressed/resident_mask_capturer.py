@@ -64,6 +64,35 @@ def pathp_cudagraph_enabled() -> bool:
     return os.environ.get("SGLANG_PATHP_CUDAGRAPH", "0") == "1"
 
 
+def _target_context_pages(c4_page_size: int) -> int:
+    """Number of c4 pages a target-context request spans:
+        TGT_CTX tokens / 4 (c4 4:1 compress) / c4_page_size chunks-per-page.
+    TGT_CTX = SGLANG_DSV4_TARGET_CONTEXT (the admission target context, tokens)."""
+    tgt_ctx_tok = int(os.environ.get("SGLANG_DSV4_TARGET_CONTEXT", "262144"))
+    tgt_chunks = (tgt_ctx_tok + 3) // 4                       # c4 4:1 compression
+    return (tgt_chunks + c4_page_size - 1) // c4_page_size    # ceil to whole pages
+
+
+def _resolve_page_kmax(c4_page_size: int) -> int:
+    """Resolve KMAX (max c4 pages recalled resident per request).
+
+    SGLANG_PATHP_PAGE_KMAX_RATIO=<f> (>0) → KMAX = ceil(f * target_context_pages),
+    so the resident set covers ~f of the target context (proportional, not a fixed
+    6144-chunk ceiling). Falls back to the fixed SGLANG_PATHP_PAGE_KMAX (default 96)
+    when the ratio env is unset/<=0. Clamped to >=1. MUST stay in sync with the
+    reserve sizing in model_runner_kv_cache_mixin (which imports this helper)."""
+    ratio = float(os.environ.get("SGLANG_PATHP_PAGE_KMAX_RATIO", "0") or "0")
+    if ratio > 0:
+        kmax = max(1, int((_target_context_pages(c4_page_size) * ratio) + 0.9999))
+        logger.info(
+            f"[Path-P] KMAX by ratio: {ratio:.3f} * {_target_context_pages(c4_page_size)} "
+            f"target-ctx pages = KMAX={kmax} (TGT_CTX="
+            f"{os.environ.get('SGLANG_DSV4_TARGET_CONTEXT', '262144')} tok)"
+        )
+        return kmax
+    return int(os.environ.get("SGLANG_PATHP_PAGE_KMAX", "96"))
+
+
 class ResidentMaskCapturer:
     """Owns the global static `resident_chunk_mask` GPU buffer + the in-graph mask
     helper + (Strategy A) the side-band Level-1 scoring trigger.
@@ -148,6 +177,28 @@ class ResidentMaskCapturer:
         self._stagger_cycle = os.environ.get("SGLANG_PATHP_STAGGER_CYCLE", "0") == "1"
         self._req_phase: dict[int, int] = {}
         self._next_phase = 0
+        # ── SAFE-RELEASE (2026-07-14 concurrency root-cause fix, gated) ──────────────
+        # _reset_changed_rows releases a changed/vacated row's page-blocks by reading
+        # resident_pool_loc_buf[bi] and calling release_req_pool_locs (which clears those
+        # pages' lut GLOBALLY). But under filter_batch COMPACTION (a middle request finishes
+        # → live requests shift down into lower rows), a row's "changed" occupant is often a
+        # STILL-ALIVE request that merely shifted position. Releasing its pages clears a LIVE
+        # request's lut → its next remap returns -1 → it loses that page's KV → confidently-
+        # wrong answer. Purely concurrency-triggered (no compaction at conc=1 → matches the
+        # data: docs 339/326/249 correct+deterministic at conc=1, wrong at conc=8). FIX: only
+        # release pages that are NOT owned by ANY currently-live decode row (the true gone set).
+        # Occupancy is tiny (1395/14335, no eviction pressure) so skipping stale releases is
+        # free. Gate OFF = current (buggy) behavior byte-identical.
+        self._safe_release = os.environ.get("SGLANG_PATHP_SAFE_RELEASE", "0") == "1"
+        # NO-ROW-RELEASE (2026-07-15, the MINIMAL fix): the whole cross-request interference is
+        # caused by _reset_changed_rows clearing lut by BUFFER-ROW position, which nukes LIVE
+        # requests' lut on filter_batch compaction. But that release is REDUNDANT for correctness:
+        # discard_copied_pages already clears a reused physical page's lut at admission (so a new
+        # request re-recalls fresh bytes), and page-LRU bounds capacity (resident ~1911 << 14335,
+        # ~never evicts). So the standard fix is to simply STOP touching other requests' state:
+        # skip the row-based release entirely. Correctness = admission-discard + LUT_TRUTH + LRU
+        # (all pre-existing). No owner tracking, no partition, no SAFE isin. Gate OFF = current.
+        self._no_row_release = os.environ.get("SGLANG_PATHP_NO_ROW_RELEASE", "0") == "1"
 
         # ── Step-1/2: score-resident-only (env SGLANG_PATHP_SCORE_RESIDENT=1) ──
         # Instead of scoring the FULL c4 history every step then masking (apply_mask_in_graph),
@@ -168,7 +219,19 @@ class ResidentMaskCapturer:
         # (page-select vs scratch-pack) and the indexer's KV source (live pool vs scratch) differ.
         # Requires score_resident on (shares its buffer plumbing). Gate off = unchanged.
         self._page_recall = os.environ.get("SGLANG_PATHP_PAGE_RECALL", "0") == "1"
-        self._page_kmax = int(os.environ.get("SGLANG_PATHP_PAGE_KMAX", "96"))  # max pages/req
+        # KMAX = max c4 pages recalled resident per request (page = c4_page_size chunks).
+        # Two ways to set it:
+        #   * fixed:   SGLANG_PATHP_PAGE_KMAX=<N>            (default 96)
+        #   * by ratio: SGLANG_PATHP_PAGE_KMAX_RATIO=<f>    (e.g. 0.15) → KMAX auto-scales
+        #     to a FRACTION of the target-context page count, so a longer target context gets a
+        #     proportionally larger resident set (covers ~f of the context) instead of a fixed
+        #     6144-chunk ceiling that only covered ~12% of a 512K context. TGT pages come from
+        #     SGLANG_DSV4_TARGET_CONTEXT (tokens) / 4 (c4 compress) / c4_page_size. When the
+        #     ratio env is set (>0) it OVERRIDES the fixed PAGE_KMAX. Must match the same formula
+        #     in model_runner_kv_cache_mixin (reserve sizing) — see _kmax_from_ratio() there.
+        # NOTE: KMAX is still a STARTUP constant (cuda-graph freezes resident_id_page_table
+        # [max_bs, KMAX]); the ratio just derives it from TGT_CTX once at init, not per-request.
+        self._page_kmax = _resolve_page_kmax(self.c4_page_size)  # max pages/req
         # Path-I: index-K offload. When on, the indexer scores the SHRUNK index-K reserve
         # (resident_id_page_table_reserve holds reserve-block ids); when off, unchanged
         # (indexer reads resident_id_page_table = full-history phys pages).
@@ -398,6 +461,20 @@ class ResidentMaskCapturer:
         if prev_thr is not None and prev_thr.is_alive():
             prev_thr.join()
         self._cached_req_ids = req_ids
+        # OWNER-RELEASE: a req_pool_idx present LAST step but absent now = truly finished
+        # (filter_batch dropped it). Release EXACTLY the pages it owned (recorded at recall
+        # time) → precise, never touches a live req's pages. This is the correct replacement
+        # for _reset_changed_rows' buffer-row release (which clobbers live rows on compaction).
+        _eng_or = getattr(token_to_kv_pool, "_swap_engine_p", None) if token_to_kv_pool else None
+        if _eng_or is not None and getattr(_eng_or, "_owner_release", False) and prev is not None:
+            cur_set = set(req_ids[:B])
+            vanished = [r for r in set(prev) if r not in cur_set]
+            for _vr in vanished:
+                try:
+                    _eng_or.release_owned_pages(_vr)
+                except Exception as e:
+                    if self._cycle_count < 5:
+                        logger.warning(f"[ResidentMask] release_owned_pages({_vr}) failed: {e}")
         self._reset_changed_rows(req_ids, B, token_to_kv_pool)
 
     @torch.no_grad()
@@ -572,6 +649,13 @@ class ResidentMaskCapturer:
         # ── SYNC path (async off): run the side-band inline (original behavior) ──
         self._sideband_work(due, req_ids, seql_cpu, self.target_hidden_buf, page_table,
                             positions, token_to_kv_pool)
+        # DIAG (SGLANG_PATHP_FULLSYNC=1): force ALL streams to complete before returning, so the
+        # next decode graph replay cannot read reserve_buf/lut bytes that this side-band's writes
+        # (possibly on a different stream than the graph's capture stream) haven't landed yet.
+        # Tests the "graph-stream reads reserve before side-band-stream writes land" race
+        # hypothesis for the conc=1+sync non-determinism. Costs a full device sync per cycle.
+        if os.environ.get("SGLANG_PATHP_FULLSYNC", "0") == "1":
+            torch.cuda.synchronize()
         self._sb_report(B, len(due))
         self._cycle_count += 1
 
@@ -584,6 +668,35 @@ class ResidentMaskCapturer:
         it can run on a background thread while the next forward overwrites the live ones.
         Writes the live fixed-address publish buffers (mask/scratch/count/pool_loc/valid/
         reserve/lut)."""
+        # DBG-REMAP-MISS (D-0 diagnostic): read the accumulated remap sel/resident counts from
+        # the PREVIOUS decode window (remap runs in-graph per step; this side-band boundary is the
+        # out-of-graph point where a D2H read is legal). miss>0 → selected locs were dropped
+        # (lut<0) = failure mode 1 (非全集). Gate OFF → get_and_reset returns None (no-op).
+        _eng_rm = getattr(token_to_kv_pool, "_swap_engine_p", None)
+        if _eng_rm is not None and hasattr(_eng_rm, "get_and_reset_remap_miss"):
+            _rm = _eng_rm.get_and_reset_remap_miss()
+            if _rm is not None and _rm[0] > 0:
+                _dsf = _rm[3] if len(_rm) > 3 else -1
+                _dsv = _rm[4] if len(_rm) > 4 else -1
+                print(f"[DBG-REMAP-MISS cycle#{self._cycle_count}] sel={_rm[0]} "
+                      f"resident={_rm[1]} MISS={_rm[2]} "
+                      f"({100.0*_rm[2]/max(_rm[0],1):.2f}%) | decode-store: formed={_dsf} "
+                      f"valid={_dsv} sink={_dsf-_dsv}", flush=True)
+                # SET-DIFF (out-of-graph, direct sum ok): mask-in count vs recalled(lut>=0) count.
+                # mask marks ALL kept chunks (incl decode-range); lut>=0 = actually in reserve.
+                # gap = masked-in but not in reserve = the miss source. Split decode-region cells
+                # (lut>=decode_base) from recall cells (0<=lut<decode_base) to see composition.
+                try:
+                    _mask_in = int(self.resident_chunk_mask.sum().item()) if self.resident_chunk_mask is not None else -1
+                    _lut0 = _eng_rm.chunk_cell_lut[0]
+                    _db = getattr(_eng_rm, "decode_base", 0)
+                    _lut_recall = int(((_lut0 >= 0) & (_lut0 < _db)).sum().item())
+                    _lut_decode = int((_lut0 >= _db).sum().item())
+                    print(f"[DBG-SETDIFF cycle#{self._cycle_count}] mask_in={_mask_in} "
+                          f"lut_recall={_lut_recall} lut_decode={_lut_decode} "
+                          f"lut_total={_lut_recall+_lut_decode}", flush=True)
+                except Exception as _e:
+                    print(f"[DBG-SETDIFF] err {_e}", flush=True)
         # PROBE (SGLANG_PATHP_SKIP_SBWORK=1): skip the ENTIRE per-req side-band body (score +
         # finalize + scatter + scratch + recall) but keep the bg-thread dispatch machinery. If
         # run=1 jumps to ~112, the tax is 100% inside this body (GPU work + .item()/.tolist
@@ -731,25 +844,97 @@ class ResidentMaskCapturer:
             if os.environ.get("SGLANG_PATHP_SKIP_AFTER_SCRATCH", "0") == "1":
                 continue
             # ── map per-req LOGICAL keep -> GLOBAL pool locs, scatter into mask ──
+            # prefill_chunks = this req's prefill c4 chunk count (decode chunks have logical
+            # index >= this). Fetched from the swap engine's _prefill_chunks_t[ri] (set by
+            # register_decode_req). -1 (unregistered / gate-off) → exclude nothing (byte-safe).
+            _pc = -1
+            _eng = getattr(token_to_kv_pool, "_swap_engine_p", None) if token_to_kv_pool else None
+            if _eng is not None and getattr(_eng, "_own_reserve", False):
+                _pct = getattr(_eng, "_prefill_chunks_t", None)
+                if _pct is not None and 0 <= ri < _pct.numel():
+                    _pc = int(_pct[ri].item())
             _t = self._sb_tic()
-            kept_locs = self._scatter_logical_keep(bi, n_blk, keep, page_table)
+            kept_locs = self._scatter_logical_keep(bi, n_blk, keep, page_table, _pc)
             self._sb_toc("scatter", _t)
             _sb_yield()
             if kept_locs is not None and kept_locs.numel() > 0:
-                batched_kept.append(kept_locs)
+                batched_kept.append((ri, kept_locs))
+                # OWNER-RELEASE: record page ownership HERE (per-req ri + its kept_locs) so recall
+                # can stay BATCHED (the healthy delta-recall path; per-req recall calls thrashed:
+                # new_pages=sel every cycle). Ownership = this req's selected physical pages this
+                # cycle, accumulated across cycles (see engine). No engine-signature dependence.
+                if _eng is not None and getattr(_eng, "_owner_release", False):
+                    try:
+                        _eng.record_owned_pages(ri, kept_locs)
+                    except Exception:
+                        pass
         # ── Phase-2 BATCHED recall over the union of all due reqs' kept locs (one call). ──
         union_locs = None
         if batched_kept:
-            union_locs = (batched_kept[0] if len(batched_kept) == 1
-                          else torch.cat(batched_kept))
+            union_locs = (batched_kept[0][1] if len(batched_kept) == 1
+                          else torch.cat([lc for _, lc in batched_kept]))
             _t = self._sb_tic()
-            # PROBE (SGLANG_PATHP_SKIP_RECALL=1): skip ONLY the recall (H2D + CPU gather + D2H
-            # .tolist) to bisect whether the bg-thread tax that OFE_SKIP eliminated is the recall
-            # (the heavy/syncing part) vs score/scatter. Output wrong (reserve not refreshed) —
-            # speed-isolation only.
             if os.environ.get("SGLANG_PATHP_SKIP_RECALL", "0") != "1":
                 self._recall_resident_to_reserve(token_to_kv_pool, union_locs)
             self._sb_toc("recall", _t)
+        # ── DBG-ALIGN (D-0 diagnostic, out-of-graph, direct .item() ok): the 3-way check the
+        # user asked for. For each due req, compare (1) the pages the MEMORY INDEXER selected
+        # (resident_id_page_table[bi,:K], what the Lightning Indexer will score this cycle)
+        # against (3) the pages actually IN RESERVE (chunk_cell_lut>=0). A page selected for
+        # scoring but NOT in reserve → its top-512 picks remap to -1 → dropped → the MISS.
+        # This localizes whether "indexer-scored pages" and "reserve pages" are aligned.
+        if getattr(self, "_dbg_remap_miss_align", False) or os.environ.get("SGLANG_PATHP_DBG_REMAP_MISS", "0") == "1":
+            _eng_a = getattr(token_to_kv_pool, "_swap_engine_p", None)
+            if (_eng_a is not None and self.resident_id_page_table is not None
+                    and hasattr(_eng_a, "chunk_cell_lut")):
+                try:
+                    ps_a = self.c4_page_size
+                    lut0_a = _eng_a.chunk_cell_lut[0]
+                    for _bi in due[:2]:   # first 1-2 due reqs is enough to characterize
+                        _pt = self.resident_id_page_table[_bi]       # [pages] full-history phys page ids
+                        _nz = _pt[_pt > 0]                           # nonzero selected pages (page 0 = pad/sink)
+                        if _nz.numel() == 0:
+                            continue
+                        _chunk0 = (_nz.to(torch.int64) * ps_a).clamp(0, lut0_a.numel() - 1)
+                        _cell0 = lut0_a[_chunk0]                     # reserve cell of each selected page's chunk-0
+                        _in_reserve = int((_cell0 >= 0).sum().item())
+                        _n_sel_pages = int(_nz.numel())
+                        # CHUNK-LEVEL: for the selected pages, count how many of their 64*n chunks
+                        # have lut>=0 (readable in reserve). page-in-reserve (chunk-0 ok) does NOT
+                        # guarantee all 64 chunks ok. all_chunks = pages*64 + [0..63].
+                        _off = torch.arange(ps_a, device=_nz.device, dtype=torch.int64)
+                        _all_ch = (_nz.to(torch.int64).unsqueeze(1) * ps_a + _off.unsqueeze(0)).reshape(-1)
+                        _all_ch = _all_ch.clamp(0, lut0_a.numel() - 1)
+                        _ch_cells = lut0_a[_all_ch]
+                        _ch_in = int((_ch_cells >= 0).sum().item())
+                        _ch_tot = int(_all_ch.numel())
+                        print(f"[DBG-ALIGN cycle#{self._cycle_count} bi={_bi}] "
+                              f"indexer_selected_pages={_n_sel_pages} in_reserve={_in_reserve} "
+                              f"NOT_in_reserve={_n_sel_pages - _in_reserve} | "
+                              f"chunks={_ch_tot} chunk_in_reserve={_ch_in} "
+                              f"chunk_MISS={_ch_tot - _ch_in} ({100.0*(_ch_tot-_ch_in)/max(_ch_tot,1):.1f}%)",
+                              flush=True)
+                        # DBG-ALIGN2 (root-cause probe 2026-07-16): localize WHERE the selected-
+                        # but-not-in-reserve pages fall. For the selected phys pages _nz check
+                        # (a) in recall's page->block map p2b, (b) in resident_chunk_mask (would
+                        # attention even read them?), plus max phys page vs n_logical_pages.
+                        try:
+                            _p2b = getattr(_eng_a, "_g_page_to_block", None)
+                            if _p2b is not None:
+                                _selpg = _nz.to("cpu").tolist()
+                                _in_p2b = sum(1 for p in _selpg if int(p) in _p2b)
+                                _m = self.resident_chunk_mask
+                                _c0 = (_nz.to(torch.int64) * ps_a).clamp(0, _m.numel() - 1)
+                                _in_mask = int(_m[_c0].sum().item())
+                                _maxpg = int(_nz.max().item())
+                                print(f"[DBG-ALIGN2 cycle#{self._cycle_count} bi={_bi}] "
+                                      f"sel_pages={len(_selpg)} in_p2b={_in_p2b} in_mask={_in_mask} "
+                                      f"maxphys_page={_maxpg} n_logical_pages~{lut0_a.numel()//ps_a} "
+                                      f"p2b_total={len(_p2b)}", flush=True)
+                        except Exception as _ea2:
+                            print(f"[DBG-ALIGN2] err {_ea2}", flush=True)
+                except Exception as _ea:
+                    print(f"[DBG-ALIGN] err {_ea}", flush=True)
         # Path-I: after recall populated chunk_cell_lut for the recalled pages, remap this
         # cycle's resident_id_page_table (full-history phys pages) -> reserve-block ids into
         # resident_id_page_table_reserve, which the in-graph indexer reads under index-K
@@ -844,9 +1029,22 @@ class ResidentMaskCapturer:
             # whose row wasn't reused by a shift), then zero them. Idempotent (locs already -1
             # are skipped). Bounds _g_chunk_to_cell to live requests → keeps eviction scan cheap.
             eng_t = getattr(token_to_kv_pool, "_swap_engine_p", None) if token_to_kv_pool else None
-            if eng_t is not None and hasattr(eng_t, "release_req_pool_locs"):
+            # OWNER-RELEASE owns page reclaim (precise, by req identity in on_forward_begin).
+            # Skip this buffer-row tail release entirely when it's on (it's the buggy path).
+            _owner_on = eng_t is not None and (getattr(eng_t, "_owner_release", False)
+                                               or self._no_row_release)
+            if eng_t is not None and not _owner_on and hasattr(eng_t, "release_req_pool_locs"):
                 tail_locs = self.resident_pool_loc_buf[B:]
                 tail_locs = tail_locs[tail_locs >= 0]
+                if self._safe_release and tail_locs.numel() > 0:
+                    # SAFE-RELEASE: a page in the (beyond-batch) tail may still be owned by a
+                    # LIVE row [0,B) after compaction. Only release tail pages NOT present in any
+                    # live row → never clears a live request's lut.
+                    live_locs = self.resident_pool_loc_buf[:B]
+                    live_locs = live_locs[live_locs >= 0]
+                    if live_locs.numel() > 0:
+                        live_set = torch.unique(live_locs)
+                        tail_locs = tail_locs[~torch.isin(tail_locs, live_set)]
                 if tail_locs.numel() > 0:
                     try:
                         eng_t.release_req_pool_locs(tail_locs)
@@ -872,9 +1070,29 @@ class ResidentMaskCapturer:
             # locs are still in resident_pool_loc_buf[bi] (before we overwrite to -1) — release
             # them so their cells return to the free-list, bounding c2c to live requests.
             eng = getattr(token_to_kv_pool, "_swap_engine_p", None) if token_to_kv_pool else None
-            if eng is not None and hasattr(eng, "release_req_pool_locs"):
+            _owner_on2 = eng is not None and (getattr(eng, "_owner_release", False)
+                                              or self._no_row_release)
+            if eng is not None and not _owner_on2 and hasattr(eng, "release_req_pool_locs"):
                 old_locs = self.resident_pool_loc_buf[idx]          # [n_changed, buf], -1 padded
                 old_locs = old_locs[old_locs >= 0]
+                if self._safe_release and old_locs.numel() > 0:
+                    # SAFE-RELEASE: exclude locs still owned by ANY currently-live row (rows
+                    # [0,B) that did NOT change = unshifted live requests, PLUS the new occupants
+                    # of the changed rows). A page held by a live request must NOT be released
+                    # (that would clear a live req's lut → KV loss). Build the live-owned loc set
+                    # from all rows [0,B) EXCEPT the ones being vacated-without-reuse; simplest
+                    # sound superset: keep locs that appear in any row [0,B) other than via the
+                    # exact (row) we're releasing. We approximate the true "gone" set as: locs in
+                    # the changed rows' OLD content that do NOT also appear in the CURRENT live
+                    # rows [0,B). Since the buffer for rows [0,B) already reflects post-shift live
+                    # occupants, intersect-exclude against it.
+                    live_locs = self.resident_pool_loc_buf[:B]
+                    live_locs = live_locs[live_locs >= 0]
+                    if live_locs.numel() > 0:
+                        live_set = torch.unique(live_locs)
+                        # keep old_locs NOT in live_set (torch.isin: gone pages only)
+                        gone = old_locs[~torch.isin(old_locs, live_set)]
+                        old_locs = gone
                 if old_locs.numel() > 0:
                     try:
                         eng.release_req_pool_locs(old_locs)
@@ -1550,13 +1768,24 @@ class ResidentMaskCapturer:
         return cache.get(compress_layer_id)
 
     @torch.no_grad()
-    def _scatter_logical_keep(self, bi, n_blk, keep, page_table):
+    def _scatter_logical_keep(self, bi, n_blk, keep, page_table, prefill_chunks=-1):
         """Map a per-req LOGICAL keep mask (bool[n_blk]) to GLOBAL pool locs via the
         page_table and write into resident_chunk_mask. First CLEAR this req's pool
         locs (set non-kept to False), then set kept to True — so a chunk dropped this
         cycle actually loses residency. Returns the kept GLOBAL pool_locs (1-D long)
         so the caller can ALSO recall them into the Path-P reserve (Phase-2) — the same
-        loc space recall_chunks/remap use, so mask and reserve stay in lock-step."""
+        loc space recall_chunks/remap use, so mask and reserve stay in lock-step.
+
+        DECODE-RANGE EXCLUSION (2026-07-14 root-cause fix): chunks with LOGICAL index
+        >= prefill_chunks are decode-generated. Their KV bytes live ONLY in the reserve
+        decode-region (written in-graph by store_decode_to_reserve) — they are NOT in the
+        CPU mirror (which is zero there). If we returned them in kept_locs, the Phase-2
+        mirror→reserve recall would copy ZEROS over the real decode KV and double-write
+        chunk_cell_lut (recall-cell{zeros} vs decode-cell{real}, last-writer-wins →
+        intermittent zero KV → conc=1 temp=0 non-determinism / rambling). So they stay in
+        the resident_chunk_mask (attention reads them via their decode-region cell) but are
+        EXCLUDED from the recall locs. prefill_chunks<0 (unregistered / gate-off) → exclude
+        nothing (byte-unchanged from the pre-fix path)."""
         ps = self.c4_page_size
         j = torch.arange(n_blk, device=self.device)
         phys_page = page_table[bi, j // ps].to(torch.long)
@@ -1565,7 +1794,13 @@ class ResidentMaskCapturer:
         keep_dev = keep.to(self.device, dtype=torch.bool)
         self.resident_chunk_mask[pool_loc] = keep_dev
         # the kept locs (resident_set in GLOBAL pool-loc space) — for Phase-2 recall.
-        return pool_loc[keep_dev]
+        # Exclude decode-range chunks (logical index >= prefill_chunks): they're resident
+        # in the mask but must NOT be mirror-recalled (their bytes are only in decode-region).
+        recall_keep = keep_dev
+        if prefill_chunks >= 0:
+            not_decode = j < prefill_chunks
+            recall_keep = keep_dev & not_decode
+        return pool_loc[recall_keep]
 
 
     # ── Strategy A side-band hook (cycle boundary): scatter a finalized resident_set

@@ -1188,31 +1188,6 @@ class C4Indexer(nn.Module):
         """
         _maybe_init()   # 只在 cmd 文件更新时才重新读取，同一请求内多次调用无额外开销
 
-        # ── Lightning Indexer 推理 hook (Stage 2, 与 tracker 研究线并存) ──
-        # SGLANG_RETRIEVER_INLINE=1 时, 用训练好的 retriever inline 打分 + mask,
-        # 独立于上面文件协议的 pass1/pass2 tracker。零开销当 env 未设。
-        if _os.environ.get("SGLANG_RETRIEVER_INLINE", "0") == "1":
-            from sglang.srt.layers.attention.compressed.inline_retriever_hook import (
-                get_inline_hook,
-            )
-            _inline = get_inline_hook()
-            _indexer_self = self
-
-            def _inline_score_hook(logits, seq_lens, forward_batch):
-                try:
-                    ttkp = forward_batch.token_to_kv_pool
-                    clid = ttkp.layer_mapping[_indexer_self.layer_id].compress_layer_id
-                    return _inline(logits, seq_lens, forward_batch, _indexer_self, clid)
-                except Exception as _e:
-                    # fail-open: never crash decode on a hook bug; log once.
-                    if not getattr(_indexer_self, "_inline_err_logged", False):
-                        _indexer_self._inline_err_logged = True
-                        import logging as _lg
-                        _lg.getLogger(__name__).exception(f"[InlineRetriever] hook error: {_e}")
-                    return logits
-
-            return _inline_score_hook
-
         if not _pass1_active and _pass2_mask is None and not _logits_dump_active and not _pass1_topp_active and not _pass1_topp_nlayer_active and not _dump_training_active:
             return None   # 没有激活实验，返回 None，后端不会调用 hook
 

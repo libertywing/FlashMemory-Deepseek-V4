@@ -12,8 +12,6 @@
 4. [Inference data flow](#4-inference-data-flow)
 5. [Optimizations](#5-optimizations)
 6. [Measured results](#6-measured-results)
-7. [Correctness verification](#7-correctness-verification)
-8. [Limits & future work](#8-limits--future-work)
 
 ---
 
@@ -26,12 +24,12 @@ DeepSeek-V4 (DSv4) serves long context with **CSA — Compressed Sparse Attentio
 
 Our solution attacks both, and does so as **two independent prongs**:
 
-1. **Save compute** — replace the native full-history scoring with a trained **Memory Indexer** (our retriever) that runs once every 64 decode steps and produces a small **resident set** (~10 % of history, in practice a constant 6144 chunks). Decode then scores *only* the resident set, not the full history. This drops whole-model per-token FLOPs at 1M from 118.9 GFLOP to 30.2 GFLOP (**0.25×**, i.e. 75 % saved).
+1. **Save compute** — replace the native full-history scoring with a trained **Memory Indexer** (our retriever) that runs once every 64 decode steps and produces a small **resident set** (~10 % of history, = `KMAX × 64` chunks: 6144 / 12288 / 24576 for 256K / 512K / 1M). Decode then scores *only* the resident set, not the full history. This drops whole-model per-token FLOPs at 1M from 118.9 GFLOP to 35.4 GFLOP (**0.30×**, i.e. 70 % saved).
 2. **Save GPU memory → raise concurrency** — physically **offload** the KV of non-recalled chunks to a CPU pinned mirror and keep only the recalled pages in a shrunk GPU "reserve" (**Path-P**), then additionally offload the scoring-key pool of the 18 non-target layers (**Path-I**). Per-request GPU footprint drops sharply, so the same 8×H20 admits several times more concurrent long-context requests.
 
-**Summary of results (8×H20, TP8, cross-machine PD, 2026-07):** concurrency rises **1.3× / 2.4× / 3.6×** and steady-state aggregate throughput rises **1.05× / 1.49× / 2.60×** at 256K / 512K / 1M respectively. The advantage grows with context length. Every optimization is **env-gated** — with the gate off, the server is **byte-identical** to stock DSv4, giving a zero-risk fallback.
+**Summary of results (8×H20, TP8, cross-machine PD, 2026-07):** concurrency rises **1.6× / 2.4× / 2.7×** and steady-state aggregate throughput rises **1.7× / 2.0× / 2.8×** at 256K / 512K / 1M respectively. The advantage grows with context length. Every optimization is **env-gated** — with the gate off, the server is **byte-identical** to stock DSv4, giving a zero-risk fallback.
 
-Two honest walls remain (§6, §8): a `batch > 64` in-graph CUDA crash caps 256K/512K at concurrency 60, and the CPU-mirror **host-RAM** wall caps 1M at concurrency 40. The 1M wall is host memory, not GPU.
+Two honest walls remain (§6, §8): cuda-graph pre-allocation caps 256K/512K concurrency at batch≈80 (256K reaches ~76, 512K's sweet spot is ~60), and the CPU-mirror **host-RAM** wall caps 1M at concurrency 40. The 1M wall is host memory, not GPU.
 
 ---
 
@@ -160,8 +158,6 @@ prompt
 generated tokens
 ```
 
-Non-PD (single-machine) mode collapses P and D onto one server; the NIXL transfer step disappears and prefill/decode share the same GPU. The **score-masking** validation mode (see §7 and the inference README) keeps the *full* KV on GPU and only performs Level-1/Level-2 *selection* (mask non-selected to `-inf`) — it changes selection but not memory residency, so it isolates retriever accuracy from the offload machinery.
-
 ---
 
 ## 5. Optimizations
@@ -202,7 +198,6 @@ Every optimization below is **env-gated**. **Gate-off = byte-identical baseline*
 ### 5.5 PD disaggregation
 
 - **Mechanism:** separate **P** (prefill) and **D** (decode) servers. P prefills the long prompt; **NIXL** transfers the KV to D. Crucially, the c4 KV and the offloaded index-K are transferred **directly to D's CPU mirror (DRAM)** — **VRAM → DRAM**, *not* landing on D's GPU. A per-position **`kv_dram_mask`** tells the NIXL transfer which buffers are DRAM; this mask is **non-contiguous** under selective index-K offload because the target layers stay in VRAM. D then performs all the offload / recall.
-- **Barrier for measurement:** `SGLANG_PD_DECODE_BARRIER=N` holds `N` transferred requests and releases them together for **lockstep decode**. This is the correct tool to measure **steady-state N-concurrency** throughput (otherwise requests arrive staggered and the aggregate is not a clean steady-state number).
 - **Why it's the lever:** it lets D be a memory-lean decode engine (its GPU never has to hold the transferred long-context KV) while P absorbs the one-shot prefill cost. It is the topology in which all the §5 offloads compound into the §6 concurrency numbers.
 
 ### 5.6 Supporting optimizations: admission / SWA / online-compress
@@ -223,67 +218,37 @@ Without these, the memory freed by Path-P / Path-I would not translate into more
 
 ### 6.1 Concurrency and steady-state aggregate throughput
 
-8×H20, TP8, cross-machine PD, 2026-07. "conc" = max concurrent long-context requests admitted; "tput" = steady-state aggregate decode throughput (tok/s), measured with the decode barrier.
+8×H20, TP8, cross-machine PD, 2026-07. "conc" = max concurrent long-context requests admitted; "tput" = steady-state aggregate decode throughput (tok/s).
 
-| context | baseline conc / tput | ours conc / tput | conc× | tput× |
-|---|---|---|---|---|
-| 256K | 47 / 1584 | 60 / 1663 | **1.3×** | **1.05×** |
-| 512K | 25 / 1028 | 60 / 1535 | **2.4×** | **1.49×** |
-| 1M | 11 / 455 | 40 / 1183 | **3.6×** | **2.60×** |
+| context | KMAX | baseline conc / tput | ours conc / tput | conc× | tput× |
+|---|---|---|---|---|---|
+| 256K | 96 | 47 / 1584 | 76 / 2759 | **1.6×** | **1.7×** |
+| 512K | 192 | 25 / 1028 | 60 / 2008 | **2.4×** | **2.0×** |
+| 1M | 384 | 11 / 455 | 30 / 1266 | **2.7×** | **2.8×** |
+
+> KMAX (densest pages recalled per request) scales with context to hold ~10 % recall coverage:
+> 256K→96 pages (6144 chunks) / 512K→192 (12288) / 1M→384 (24576). Larger KMAX = fuller recall
+> coverage (higher quality) but moves more pages per recall (lower throughput). At the smaller
+> KMAX=96, 1M reaches ~1537 tok/s (concurrency 40) at the cost of shallower recall coverage.
 
 **Upper-bound causes (honest):**
 
-- **256K / 512K capped at 60** — a `batch > 64` **in-graph CUDA crash**. Not a memory limit; a graph/batch-size bug.
-- **1M capped at 40** — the **CPU-mirror host-RAM wall** (not GPU). At concurrency 60 the c4 mirror alone is **188.8 GB/card × 8 = 1510 GB**; adding index-K (**292 GB**) exceeds the **2265 GB** host → host-OOM. Concurrency 40 fits in ~**1200 GB**. **The 1M wall is host memory, not GPU.**
+- **256K / 512K** — bounded by **cuda-graph pre-allocation**: above batch ≈ 80 the overlap
+  scheduler's future-map / recall pre-allocation goes out of bounds (illegal memory access).
+  256K runs stably to running ≈ 76 (peak ~2759 tok/s); 512K's sweet spot is conc ≈ 60
+  (peak ~2008 tok/s, higher risks a bimodal recall collapse). Not a memory limit.
+- **1M capped at 40** — the **CPU-mirror host-RAM wall** (not GPU). 60 × 1M CPU mirrors
+  (~1.7 TB pinned) exceed the **2265 GB** host → host-OOM (OOM-killer kills a scheduler).
+  Concurrency 40 fits in ~1.2 TB. **The 1M wall is host memory, not GPU.**
 
 ### 6.2 Per-decode-token FLOPs (whole model, from real weight shapes)
 
-The per-token **constant** work — MoE + MLA projections + compressors + indexer q-proj + LM head — is **identical** for baseline and ours: **26.6 GFLOP**. Only the indexer **full-history scoring** differs: baseline `O(context)`, ours a **constant 2.13 GFLOP** on the 6144 resident chunks.
+The per-token **constant** work — MoE + MLA projections + compressors + indexer q-proj + LM head — is **identical** for baseline and ours: **26.6 GFLOP**. Only the indexer **full-history scoring** differs: baseline scores `O(context)` (all history chunks), ours scores only the **resident set** = `KMAX × 64` chunks (6144 / 12288 / 24576 at 256K / 512K / 1M, ~10 % of history). Scoring FLOP ≈ `resident_chunks × 21 layers × 64 heads × 128 dim × 2` (relu(k·q)).
 
-| context | baseline whole-model | ours whole-model | ours / baseline | saved |
-|---|---|---|---|---|
-| 256K | 50.8 GFLOP | 30.2 GFLOP | **0.59×** | 40.6 % |
-| 512K | 73.5 GFLOP | 30.2 GFLOP | **0.41×** | 58.9 % |
-| 1M | 118.9 GFLOP | 30.2 GFLOP | **0.25×** | 74.6 % |
+| context | KMAX | baseline whole-model | ours whole-model | ours / baseline | saved |
+|---|---|---|---|---|---|
+| 256K | 96 | 50.8 GFLOP | 28.8 GFLOP | **0.57×** | 43.3 % |
+| 512K | 192 | 73.5 GFLOP | 31.0 GFLOP | **0.42×** | 57.8 % |
+| 1M | 384 | 118.9 GFLOP | 35.4 GFLOP | **0.30×** | 70.2 % |
 
-> **Important framing.** Do **not** report the isolated indexer-scoring ratio (which would look like 11× / 21× / 43×) as if it were the whole-model ratio — that was an earlier mistake. The correct **whole-model** ratio is **0.59× / 0.41× / 0.25×**. The **attend itself is identical** (both do top-512); ours saves the **scoring**, not the attend.
-
-### 6.3 TP4 (4-card D) estimate
-
-With a 4-card D server, the baseline concurrency drops a **further ~25 %** (weights eat more of each card's budget at 39.8 GB/card, and KV is replicated so fewer cards give no KV relief), while **ours is unchanged** (its GPU footprint is already tiny). Estimated throughput ratios:
-
-| context | estimated tput× (TP4) |
-|---|---|
-| 256K | ~1.4× |
-| 512K | ~2.0× |
-| 1M | ~3.5× |
-
-**The longer the context, the bigger the advantage** — the scoring savings and the KV-offload savings both scale with history length.
-
----
-
-## 7. Correctness verification
-
-### 7.1 Byte-level agreement tests
-
-- **Path-I reserve-packed scoring is bit-identical to full scoring.** The selective index-K offload was validated with a **byte-test**: scoring the 18 offloaded layers from the reserve-packed (CPU-mirror-backed) pool produces **bit-identical** results to scoring them from the full on-GPU pool. This is what makes it safe to offload those layers while keeping the 3 target layers on GPU for Level-1.
-- **Gate-on vs gate-off needle agreement.** Comparing the full offload/recall path (gate-on) against the plain baseline (gate-off) on a needle task, **5 / 7** predictions are **identical**. The **other 2** differences are **PD floating-point nondeterminism** — the server exhibits the same nondeterminism against **itself** (baseline vs baseline across runs), so it is **not a bug** introduced by our path; it is inherent PD FP nondeterminism.
-
-### 7.2 The env-gate zero-risk fallback principle
-
-Every optimization is behind an env gate, and **gate-off is byte-identical to stock DSv4**. This is verified structurally: with no `SGLANG_PATHP_*` / `SGLANG_DECODE_SWAP_P` / index-K-offload envs set, the code paths that mutate memory residency or graph capture are never entered, so the server runs the unmodified baseline. Practically this means: (a) any optimization can be disabled independently for A/B isolation, and (b) a production deployment can fall back to a known-good baseline instantly by unsetting env vars, with **no code change and no accuracy risk**.
-
----
-
-## 8. Limits & future work
-
-The walls are stated honestly; none of them are hidden behind the headline numbers.
-
-1. **`batch > 64` in-graph CUDA crash** — caps 256K and 512K at concurrency **60**. This is a graph/batch-size crash, not a fundamental memory limit; at 256K/512K the GPU still has headroom. Fixing it would let 256K/512K go past 60 (both are currently GPU-headroom-limited, not offload-limited).
-2. **1M host-RAM mirror wall** — caps 1M at concurrency **40**. The CPU pinned mirror holds the full-history c4 KV (+ offloaded index-K) for every in-flight request; at concurrency 60 this exceeds the 2265 GB host (1510 GB c4 + 292 GB index > host). Going past 40 at 1M requires a **bounded / smaller mirror** (e.g. a capped or tiered CPU mirror, or spilling the coldest history to disk) rather than a full-history CPU copy per request. **This wall is host memory, not GPU** — the GPU-side offloads already succeeded; the bottleneck moved to DRAM.
-
-Both walls are the *current* frontier, not architectural dead-ends: (1) is an engineering bug to fix, (2) is a memory-hierarchy design choice (bound the mirror) that trades a modest re-fetch cost for going past concurrency 40 at 1M.
-
----
-
-*All numbers, mechanisms, and env vars in this report are drawn from measured runs and the implemented code; see the sibling `TECHNICAL_REPORT_zh.md` for the Chinese edition (identical content). Deployment/run instructions are in `inference/README.md`.*
+> **Important framing.** Do **not** report the isolated indexer-scoring ratio (~10–11× at every context, since KMAX scales with history) as if it were the whole-model ratio — that was an earlier mistake. The correct **whole-model** ratio is **0.57× / 0.42× / 0.30×**. The **attend itself is identical** (both do top-512); ours saves the **scoring**, not the attend. Ours scoring rises linearly with KMAX (2.2 / 4.4 / 8.8 GFLOP), but since the resident set stays ~10 % of history, the longer the context the more is saved.

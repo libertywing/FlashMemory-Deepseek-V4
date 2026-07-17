@@ -155,7 +155,8 @@ class CompressorBackend:
                 )
                 if get_resident_mask_capturer() is not None:
                     _eng.store_decode_to_reserve(
-                        _clid, forward_batch.req_pool_indices, out_loc, pack
+                        _clid, forward_batch.req_pool_indices, out_loc, pack,
+                        seq_lens=forward_batch.seq_lens,
                     )
                 else:
                     _eng.store_decode(_clid, out_loc, pack)  # eager: mirror + in-step recall

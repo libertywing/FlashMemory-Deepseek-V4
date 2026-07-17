@@ -21,7 +21,7 @@ The client tells the server to enter dump mode via a file protocol at `/tmp/dsv4
 
 | File | Purpose |
 |---|---|
-| `start_dump_server.sh` | Launches a **dump-dedicated** sglang server (distinct from `start_server.sh`'s inference-verification mode) |
+| `start_dump_server.sh` | Launches a **dump-dedicated** sglang server (native DSv4, `--disable-cuda-graph`, no offload/recall) |
 | `run_dump_training_data.py` | Client: sends concurrent inference requests, drives the dump, collects outputs |
 | `experiment_utils.py` | Client dependency: input-format detection, message building, cmd-file read/write |
 | `example_data/creative_writing_multiturn_filtered.subset10.jsonl` | 10 example inputs (see §3) |

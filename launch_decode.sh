@@ -2,14 +2,12 @@
 # =============================================================================
 # launch_decode.sh — PD 分离 · D (decode) server, 高并发推理配置.
 #
-# 这是 ours 全部并发/显存优化的落地端 (Path-P c4 offload + Path-I index-K
+# 这是 FlashMemory 全部并发/显存优化的落地端 (Path-P c4 offload + Path-I index-K
 # offload + 两级 page-recall + cuda-graph)。P (prefill) 端只管把长 prompt
 # prefill 完、把 KV 传过来; 所有 offload/召回都在 D 端。
-#
-# 与「单机准确率验证」(../start_server.sh, 纯 score-masking) 的区别:
-#   * 那个: 全量 KV 常驻 GPU, retriever 只 mask 选择, 不省显存。
-#   * 这个: c4 classical KV + 非-target index-K 真 offload 到 CPU mirror,
-#           GPU 只留召回页 → 每请求显存骤降 → 并发上限翻数倍。
+#   * c4 classical KV + 非-target index-K 真 offload 到 CPU mirror,
+#     GPU 只留召回页 → 每请求显存骤降 → 并发上限翻数倍。
+#   * 全部 env-gated: gate-off = 原生 DeepSeek-V4 行为 (字节不变)。
 #
 # 用法 (在 D 机上跑, GPU0-7):
 #   TGT_CONC=60 TGT_CTX=524288 CTX_LEN=1100000 bash launch_decode.sh
@@ -57,7 +55,7 @@ fi
 # ── retriever (Memory-Indexer) ckpt ──────────────────────────────────────────
 # 注意: PD 高并发路径由 resident_mask_capturer 驱动 scorer, INLINE=0 (不走 eager inline hook)。
 export SGLANG_RETRIEVER_INLINE=0
-export SGLANG_RETRIEVER_INLINE_CKPT="${CKPT:-$(cd "$(dirname "$0")/.." && pwd)/checkpoints/top3_R930_joint.pt}"
+export SGLANG_RETRIEVER_INLINE_CKPT="${CKPT:-$(cd "$(dirname "$0")" && pwd)/checkpoints/top3_R930_joint.pt}"
 export SGLANG_RETRIEVER_INLINE_LAYERS="${LAYERS:-10,12,20}"
 export SGLANG_RETRIEVER_SIGMOID_THRESH="${THRESH:-0.5}"
 export SGLANG_RETRIEVER_INTERVAL="${INTERVAL:-64}"
@@ -84,8 +82,14 @@ exec sglang serve --trust-remote-code --model-path "$MODEL" \
   --host 0.0.0.0 --port 31200
 
 # =============================================================================
-# 常用配置 (8×H20 TP8, 跨机 PD):
-#   256K:  TGT_CONC=60  TGT_CTX=262144
-#   512K:  TGT_CONC=60  TGT_CTX=524288
-#   1M:    TGT_CONC=40  TGT_CTX=1100000  PATHP_INDEX_K_OFFLOAD=1 INDEX_K_DEVICE_TOKENS=1572864
+# 常用配置 (8×H20 TP8, 跨机 PD; 实测稳态聚合 decode 峰值吞吐):
+#   256K:  TGT_CONC=76  TGT_CTX=262144                          PAGE_KMAX=96   → ~2759 tok/s
+#   512K:  TGT_CONC=60  TGT_CTX=524288                          PAGE_KMAX=192  → ~2008 tok/s
+#   1M:    TGT_CONC=40  TGT_CTX=1100000  PATHP_INDEX_K_OFFLOAD=1 INDEX_K_DEVICE_TOKENS=1572864 PAGE_KMAX=96 → ~1537 tok/s
+#
+# 说明:
+#   * PAGE_KMAX 是「质量↔吞吐」旋钮: 越大召回覆盖越全 (质量↑) 但每次 recall 搬更多页
+#     (吞吐↓, 高并发下同步召回易双峰塌陷)。上表是吞吐甜点; 需要更高召回质量可增大。
+#   * 1M 并发上限 ~40, 卡在 host DRAM (每请求 CPU mirror ∝ context; 60 份 1M mirror ~1.7TB 会 host-OOM),
+#     不是 GPU 显存或传输限。256K/512K 上限受 batch>~80 的 cuda-graph 预分配 (再高会 illegal-access)。
 # =============================================================================

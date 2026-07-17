@@ -940,11 +940,59 @@ class DecodeTransferQueue:
                 if getattr(_eng, "_own_reserve", False):
                     # B mode: c4 already in mirror (NIXL DRAM xfer). Force re-recall.
                     _n = _eng.discard_copied_pages(_logical_pages)
+                    # CROSS-REQUEST CONTAMINATION PROBE/FIX (SGLANG_PATHP_RESET_RECALL_PER_REQ=1):
+                    # wipe the global recall allocator so this request starts from a clean block
+                    # map. On the D decode server the allocator is never reclaimed across requests
+                    # (reset_req_residency doesn't fire) → a new request inherits the prior one's
+                    # block map + stale reserve bytes → non-determinism. SAFE ONLY at conc=1 (or a
+                    # barrier) — a global wipe would nuke concurrent requests' live cells. This is
+                    # the conc=1 root-cause probe; production needs per-request reclaim instead.
+                    if (os.environ.get("SGLANG_PATHP_RESET_RECALL_PER_REQ", "0") == "1"
+                            and hasattr(_eng, "reset_recall_state")):
+                        _eng.reset_recall_state()
+                        logger.info(
+                            f"[Path-P RESET] rid={decode_req.req.rid} wiped recall allocator "
+                            f"(conc=1 contamination probe)"
+                        )
+                    # DECODE-STORE FIX (2026-07-14): register this request's prefill c4 chunk
+                    # count so the in-graph decode-store (_store_decode_chunk_in_graph) can map
+                    # decode-generated chunks to their deterministic decode-resident cell
+                    # (cell = decode_base + slot*max_decode + (c4_out_loc - prefill_chunks)).
+                    # WHY HERE: on the PD-decode server the prefill-side reset_req_residency
+                    # (which normally calls register_decode_req) NEVER fires — D runs pure decode,
+                    # so that prefill/extend branch is dead. Without this, _prefill_chunks_t[ri]
+                    # stays -1 → the decode-store's validity gate (pc>=0) is always False → EVERY
+                    # decode-generated c4 chunk is funneled to the throwaway sink cell → the model
+                    # cannot attend to its own just-generated tokens' c4 KV within a recall cycle
+                    # → rambling / non-convergence on long generations. c4 chunks = prefill_len//4.
+                    if hasattr(_eng, "register_decode_req"):
+                        _eng.register_decode_req(
+                            decode_req.req.req_pool_idx,
+                            prefill_chunks=_seq // 4,
+                        )
                     logger.info(
                         f"[Path-P PD-B] rid={decode_req.req.rid} seq={_seq} c4 in mirror "
                         f"via NIXL; discarded {_n} pages from _copied "
-                        f"(range [{int(_logical_pages.min())},{int(_logical_pages.max())}])"
+                        f"(range [{int(_logical_pages.min())},{int(_logical_pages.max())}]) "
+                        f"registered decode req (prefill_chunks={_seq // 4})"
                     )
+                    # CROSS-REQUEST STATE PROBE (SGLANG_PATHP_DBG_RECALL=1): log the allocator
+                    # state THIS new request inherits, to test the "pool contamination across
+                    # requests" hypothesis. A fresh request should ideally start from a clean
+                    # allocator (next_block/p2b bounded to live reqs). If these grow monotonically
+                    # across requests (never reclaimed on the D decode server), a new request's
+                    # recall reuses cells still holding a prior request's bytes → non-determinism.
+                    if os.environ.get("SGLANG_PATHP_DBG_RECALL", "0") == "1":
+                        try:
+                            logger.info(
+                                f"[DBG-REQ-ENTER] rid={decode_req.req.rid} pool_idx="
+                                f"{decode_req.req.req_pool_idx} prefill_chunks={_seq // 4} | "
+                                f"INHERITED next_block={_eng._g_next_block} "
+                                f"p2b={len(_eng._g_page_to_block)} free_blocks="
+                                f"{len(_eng._g_free_blocks)} evictions={_eng.n_evictions}"
+                            )
+                        except Exception:
+                            pass
                 else:
                     _n = _eng.ingest_transferred_history(
                         _kvcache.c4_kv_pool, _logical_pages
@@ -1152,37 +1200,11 @@ class SchedulerDisaggregationDecodeMixin:
         if len(self.waiting_queue) == 0:
             return None
 
-        # ── BENCHMARK barrier (SGLANG_PD_DECODE_BARRIER=N): hold transferred reqs in
-        # the waiting queue until N are ready, then release together so all N start
-        # decoding from step 0 simultaneously (KV grows in lockstep). This isolates
-        # the per-request-stagger + decode-KV-accumulation confound when measuring
-        # D-server decode throughput at a target concurrency N. One-shot: once N is
-        # reached the barrier opens and stays open (running>0). Default 0 = off.
-        _barrier = int(os.environ.get("SGLANG_PD_DECODE_BARRIER", "0"))
-        if (
-            _barrier > 0
-            and self.running_batch.batch_size() == 0
-            and len(self.waiting_queue) < _barrier
-        ):
-            return None
-
         curr_batch_size = self.running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
-
-        # ── ADMISSION-RATE CAP (SGLANG_PD_DECODE_ADMIT_CAP=C): admit at most C NEW reqs per
-        # scheduler step (phase a large waiting queue into decode over several steps instead
-        # of all-at-once). Two uses: (1) page-recall crashes when >~60 reqs enter step-0
-        # decode SIMULTANEOUSLY (in-graph illegal access at barrier release) — capping the
-        # per-step admission to ≤60 phases them in so the live batch still REACHES the target
-        # N, but never grows by >C in one step; (2) it also throttles the per-step side-band
-        # recall burst. Default 0 = off (admit all, original behavior). Distinct from
-        # SGLANG_PD_DECODE_BARRIER (which gates the *first* release on reaching N).
-        _admit_cap = int(os.environ.get("SGLANG_PD_DECODE_ADMIT_CAP", "0"))
-        if _admit_cap > 0:
-            num_not_used_batch = min(num_not_used_batch, _admit_cap)
 
         # pop req from waiting queue
         can_run_list: List[Req] = []

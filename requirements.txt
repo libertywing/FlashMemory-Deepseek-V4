@@ -13,3 +13,9 @@ numpy>=1.24           # (tested: 2.4.0)
 #     pip install sgl_kernel>=0.3.21   # (match your CUDA / torch version)
 #     pip install tilelang==0.1.8
 #     pip install apache-tvm-ffi==0.1.9
+
+# ── Data generation (data_generation/run_dump_training_data.py) ──────────────────
+openai>=1.40          # OpenAI-compatible client to drive the dump sglang server (tested: 2.6.1)
+
+# ── Training (training/train.py, dataloader.py) ──────────────────────────────────
+# Uses torch + safetensors + numpy (above). DDP via torch.distributed / torchrun.

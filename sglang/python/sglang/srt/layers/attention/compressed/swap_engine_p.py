@@ -115,6 +115,21 @@ from sglang.srt.layers.attention.compressed.pathp_profile import prof
 
 C4_PAGE_SIZE = 64  # c4-tokens per page (== model page_size 256 // 4)
 _DBG = os.environ.get("SGLANG_SWAP_P_DBG", "0") == "1"
+# DBG_RECALL: per-cycle recall diagnostics (selection / allocation / content checksum) to
+# debug the conc=1 temp=0 non-determinism (suspected cross-request pool contamination). Gated
+# → default off = zero overhead. Emits [DBG-RECALL] lines to stdout (D server log).
+_DBG_RECALL = os.environ.get("SGLANG_PATHP_DBG_RECALL", "0") == "1"
+
+
+def _t_checksum(t) -> int:
+    """Cheap order-insensitive-ish content fingerprint of a tensor for run-to-run diff.
+    Sum of int32-view (mod 2^31) — enough to detect byte differences without a full hash;
+    one D2H sync (only called under _DBG_RECALL). Safe on uint8/int32 GPU tensors."""
+    try:
+        return int(t.reshape(-1).to(torch.int64).sum().item())
+    except Exception:
+        return -1
+
 
 
 def _is_cuda_graph_capturing() -> bool:
@@ -264,6 +279,42 @@ class SwapEngineP:
         # remap/attention contract is unchanged. Blocks live in the SAME [0, recall_cell_capacity)
         # cell space (block b spans cells [b*64, b*64+64)); _g_next_block is the page high-water.
         self._page_recall = os.environ.get("SGLANG_PATHP_PAGE_RECALL", "0") == "1"
+        # LUT-TRUTH (2026-07-14 root-cause fix, gated): make chunk_cell_lut the SOLE residency
+        # truth in the page-recall alloc loop. The old loop did `if pg in p2b: continue` for a
+        # MISS page (lut<0) whose p2b mapping was stale — skipping the copy + lut write, so the
+        # page stayed lut=-1 forever → attention remap returned -1 → the whole page's KV was
+        # masked out → confidently-wrong, non-deterministic answers (B,B,B,C,C even at conc=1).
+        # Root: discard_copied_pages() clears lut without popping p2b, and D's release timing is
+        # unreliable (reset_req_residency never fires on the pure-decode server), so a physical
+        # page reused by a later request is a lut-miss but a p2b-hit. FIX: a miss page ALWAYS
+        # copies (reuse the stale p2b block if present, else alloc/evict) → self-heals regardless
+        # of release timing, no per-slot partition needed. Fixes both conc=1 (sequential physical-
+        # page reuse) and conc>1 (batch). Gate OFF = byte-identical to the pre-fix path.
+        self._lut_truth = os.environ.get("SGLANG_PATHP_LUT_TRUTH", "0") == "1"
+        # OWNER-RELEASE (2026-07-15 concurrency root-cause fix, gated): the true fix for the
+        # release-clobber bug. On D the only cross-request cleanup is _reset_changed_rows, which
+        # releases pages by BUFFER-ROW position on batch composition change — but filter_batch
+        # COMPACTION shifts LIVE requests into lower rows, so the "changed" row's old locs often
+        # belong to a still-alive request → clearing them nukes a LIVE lut → KV loss → wrong
+        # answer (concurrency-only; proven by docs 339/326/249 correct at conc=1, 0/8 at conc=8).
+        # FIX: the engine records per-request page OWNERSHIP at recall time (req_pool_idx -> set
+        # of physical pages it recalled), and releases EXACTLY that set when the request truly
+        # finishes (its req_pool_idx vanishes from the decode batch). Precise identity, never
+        # touches a live request's pages, no timing/row heuristic. Gate OFF = current behavior.
+        self._owner_release = os.environ.get("SGLANG_PATHP_OWNER_RELEASE", "0") == "1"
+        self._req_owned_pages: dict[int, set] = {}   # req_pool_idx -> set(physical page ids)
+        # DBG-REMAP-MISS (2026-07-15, capture-safe diagnostic): count how many native-top-512
+        # selected locs FAIL to remap to a resident reserve cell (lut<0 → masked → dropped from
+        # the effective set = "not全集"). remap runs IN the captured decode graph, so we can't
+        # host-sync (.item()/.sum()) there. Instead accumulate into GPU scalar buffers (+= only,
+        # capture-safe) and D2H-read them ONCE per cycle at the side-band boundary (out of graph).
+        # Gate OFF = zero overhead (no buffers touched). Diagnostic only, does not change behavior.
+        self._dbg_remap_miss = os.environ.get("SGLANG_PATHP_DBG_REMAP_MISS", "0") == "1"
+        if self._dbg_remap_miss:
+            self._remap_sel_acc = torch.zeros((), dtype=torch.int64, device=device)
+            self._remap_res_acc = torch.zeros((), dtype=torch.int64, device=device)
+            self._ds_formed_acc = torch.zeros((), dtype=torch.int64, device=device)
+            self._ds_valid_acc = torch.zeros((), dtype=torch.int64, device=device)
         self._g_page_to_block: OrderedDict = OrderedDict()  # logical page -> reserve block (LRU)
         self._g_next_block = 0                              # page-block high-water (in blocks)
         self._g_free_blocks: list = []                      # reclaimed reserve blocks
@@ -326,6 +377,40 @@ class SwapEngineP:
         # per req_pool_idx -> decode slot (0..max_conc-1), assigned round-robin at prefill.
         self._req_decode_slot: dict[int, int] = {}
         self._next_decode_slot = 0
+        # CAPTURE-FREEZE FIX (2026-07-15): pre-allocate the decode-store tensors HERE, in
+        # __init__ (BEFORE cuda-graph capture), so store_decode_to_reserve's `if not
+        # _decode_t_ready: return` guard evaluates TRUE at capture → the store body is CAPTURED
+        # into the graph. Previously the tensors were lazily created in register_decode_req,
+        # which fires per-request at admission (AFTER capture) → at capture _decode_t_ready was
+        # False → the guard baked an unconditional `return` into the graph → decode chunks were
+        # NEVER stored to the reserve decode-region on the D PD-decode server → they were absent
+        # from reserve → the Lightning Indexer's top-512 (which favors the recent decode chunks)
+        # remapped them to -1 → attention couldn't read its own just-generated KV → wrong answer
+        # (the deterministic MISS ~32% on docs 149/211/319/349). register_decode_req still fills
+        # the per-req VALUES into these same fixed-address tensors later (graph reads them by
+        # gather each replay). Gated so gate-off stays byte-identical is unnecessary — this is a
+        # pure pre-alloc of the same tensors the lazy path made; behavior only CHANGES the buggy
+        # frozen-out case (makes the store actually run), which is the intended fix.
+        self._ensure_decode_tensors(4096)
+        # LOCAL OFF-BY FIX (2026-07-15, gated SGLANG_PATHP_LOCALFIX): the decode-region cell
+        # destination is `cell = decode_base + slot*_decode_resident_chunks + local`. The old
+        # `local = c4_out_loc - prefill_chunks` uses the PHYSICAL pool loc, which only equals
+        # (prefill_chunks + decode_step) for the FIRST request to ever use a req_pool_idx; a
+        # REUSED req_pool_idx gets a physical loc that jumps arbitrarily → local out of [0,
+        # _decode_resident_chunks) → the row is funneled to SINK → its lut stays -1 → remap
+        # misses it. The CORRECT local is the LOGICAL decode step: seq_lens//4 - 1 - prefill_chunks
+        # (0,1,2,… monotonic, bounded). The lut KEY stays physical loc (that is what top-512
+        # selects and remap looks up); only the cell DST computation switches to logical. Gate
+        # OFF = byte-identical (uses loc-pc).
+        self._localfix = os.environ.get("SGLANG_PATHP_LOCALFIX", "0") == "1"
+        if os.environ.get("SGLANG_PATHP_CAPFIX_OFF", "0") == "1":
+            # A/B REVERT PROBE: undo the capfix pre-alloc (back to lazy, capture-frozen behavior)
+            # to test whether the capfix pre-alloc itself is what destabilized (doc220 correct→
+            # wrong). Frees the tensors + clears the ready flag so store_decode_to_reserve's guard
+            # returns (frozen) exactly like before the fix. Diagnostic only.
+            self._prefill_chunks_t = None
+            self._decode_slot_t = None
+            self._decode_t_ready = False
         if _DBG:
             print(f"[P-DECODE-REGION] cell_capacity={self.cell_capacity} "
                   f"decode_base={self.decode_base} decode_region={_decode_region} "
@@ -672,6 +757,26 @@ class SwapEngineP:
             return self._recall_global_pages(kept_locs)
         return self._recall_global(kept_locs)
 
+    def record_owned_pages(self, req_pool_idx: int, kept_locs: torch.Tensor) -> None:
+        """OWNER-RELEASE: record (accumulate) the physical pages a request keeps resident, keyed
+        by req_pool_idx, so release_owned_pages can free EXACTLY its pages at true finish. Called
+        from the capturer's per-req scatter loop (ri + its kept_locs both in hand) — decoupled
+        from recall so recall stays BATCHED (per-req recall thrashed: new_pages=sel every cycle).
+        Accumulate (union), not replace: a page recalled earlier but dropped from this cycle's
+        selection still holds a block+lut>=0; if it fell out of the owned set it would never be
+        freed at finish → stale lut>=0 contaminates the next req reusing that physical page."""
+        if not (self._owner_release and self._page_recall) or req_pool_idx < 0:
+            return
+        if kept_locs is None or kept_locs.numel() == 0:
+            return
+        pages = torch.unique(kept_locs.detach().to("cpu", dtype=torch.int64) // C4_PAGE_SIZE)
+        cur = set(int(p) for p in pages.tolist() if p >= 0)
+        owned = self._req_owned_pages.get(int(req_pool_idx))
+        if owned is None:
+            self._req_owned_pages[int(req_pool_idx)] = cur
+        else:
+            owned |= cur
+
     def _recall_global(self, compress_locs: torch.Tensor) -> int:
         """ALL-LAYER global swap-in core. The Level-1 Memory Indexer produces ONE resident_set
         shared by every c4 layer (Phase-1 mask confines each layer's native top-512 to it), so
@@ -859,6 +964,16 @@ class SwapEngineP:
         with prof.region("recall_alloc"):
             for pg in todo_pages:
                 if pg in p2b:
+                    if self._lut_truth:
+                        # LUT-TRUTH: pg is a MISS (lut<0) but p2b still maps it — a STALE mapping
+                        # from a finished/reused request. Reuse that block but FALL THROUGH to
+                        # copy+lut-write below (do NOT skip), so the page's real bytes land in
+                        # the reserve and lut is repaired. Self-heals the desync.
+                        blk = p2b[pg]
+                        p2b.move_to_end(pg)
+                        new_pages.append(pg)
+                        new_blocks.append(blk)
+                        continue
                     p2b.move_to_end(pg)                 # LRU touch (already resident, shouldn't hit miss)
                     continue
                 if self._g_free_blocks:
@@ -887,6 +1002,23 @@ class SwapEngineP:
         off = torch.arange(ps, dtype=torch.int64)                    # [64]
         src_chunk = (pg_t.unsqueeze(1) * ps + off.unsqueeze(0)).reshape(-1)   # [P*64]
         dst_cell = (blk_t.unsqueeze(1) * ps + off.unsqueeze(0)).reshape(-1)   # [P*64]
+        # DECODE-CHUNK GUARD (2026-07-14 root-cause fix): a freshly-allocated page-block copies
+        # ALL 64 chunk offsets from the mirror. On a BOUNDARY page (prefill chunks + decode chunks
+        # in the same 64-page), the decode chunks were already written to the decode-region by
+        # store_decode_to_reserve (correct bytes) and their lut points at cell >= decode_base. The
+        # mirror is ZERO there, so copying them + rewriting the lut would clobber the real decode KV
+        # (the double-write that caused conc=1 temp=0 non-determinism). Drop any chunk whose CURRENT
+        # lut cell is already in the decode region — keep its decode-region cell untouched. Pure
+        # prefill / not-yet-stored offsets (lut<0) copy normally. _own_reserve only (byte-safe off).
+        if getattr(self, "_own_reserve", False):
+            _sc_dev = src_chunk.to(self.device).clamp_(0, self.chunk_cell_lut.shape[1] - 1)
+            _cur = self.chunk_cell_lut[0][_sc_dev]                    # [P*64] current cell (-1 if none)
+            _keep = (_cur < self.decode_base).to("cpu")               # drop decode-region chunks
+            if not bool(_keep.all()):
+                src_chunk = src_chunk[_keep]
+                dst_cell = dst_cell[_keep]
+            if src_chunk.numel() == 0:
+                return 0
         # copy bytes for ALL 21 layers (byte-exact, shared as_strided gather), THEN set lut
         # (copy-before-lut keeps the partial state safe; see _recall_global rationale).
         with prof.region("recall_copy"):
@@ -902,6 +1034,38 @@ class SwapEngineP:
         prof.count("recall_chunks", src_chunk.numel() * self.c4_layer_num)
         self._peak_cells = max(getattr(self, "_peak_cells", 0), len(p2b) * ps)
         self._foot_n = getattr(self, "_foot_n", 0) + 1
+        # ── 3-LAYER RECALL DIAGNOSTICS (SGLANG_PATHP_DBG_RECALL=1) ── to debug conc=1 temp=0
+        # non-determinism. Two runs of the same doc: diff these lines. Where the FIRST diff
+        # appears localizes the root cause:
+        #   * SEL differs      → selection (retriever scoring) is non-deterministic
+        #   * ALLOC differs     → cell allocation depends on stale cross-request state
+        #   * SRC checksum diff → the CPU mirror (NIXL-transferred c4) content differs run-to-run
+        #   * DST checksum diff (but SRC same) → mirror→reserve copy is racy/wrong
+        if _DBG_RECALL:
+            self._dbg_cycle = getattr(self, "_dbg_cycle", 0) + 1
+            _c = self._dbg_cycle
+            # SEL: which logical pages selected this cycle (sorted, first/last few + count).
+            _sel = sorted(pages_t.to("cpu").tolist())
+            _sel_head = _sel[:8]
+            _sel_tail = _sel[-4:] if len(_sel) > 12 else []
+            # ALLOC: this cycle's new (page→block) pairs (first few) + allocator state.
+            _pairs = list(zip(new_pages[:8], new_blocks[:8]))
+            # CONTENT: checksum of layer-0's SOURCE mirror rows and DEST reserve rows just copied.
+            _src_ck = _dst_ck = -1
+            try:
+                m0 = self.host_mirror[0]                     # CPU [n_logical_pages, rb]
+                _src_ck = _t_checksum(m0[torch.tensor(new_pages, dtype=torch.int64)])
+                b0 = self.reserve_buf[0]                     # GPU [reserve_pages, rb]
+                _dst_ck = _t_checksum(b0[torch.tensor(new_blocks, dtype=torch.int64)])
+            except Exception:
+                pass
+            print(
+                f"[DBG-RECALL c{_c}] SEL n={len(_sel)} head={_sel_head} tail={_sel_tail} | "
+                f"ALLOC new={len(new_pages)} pairs={_pairs} next_block={self._g_next_block} "
+                f"p2b={len(p2b)} free={len(self._g_free_blocks)} evict={self.n_evictions} | "
+                f"SRC_ck={_src_ck} DST_ck={_dst_ck}",
+                flush=True,
+            )
         if _DBG or self._foot_n % 50 == 0:
             print(f"[P-FOOT-PG] sel_pages={int(pages_t.numel())} new_pages={len(new_pages)} "
                   f"copied_chunks={int(src_chunk.numel())} resident_pages={len(p2b)} "
@@ -1125,6 +1289,13 @@ class SwapEngineP:
         idx = idx.clamp_(0, lut.numel() - 1)
         cells = lut[idx].to(torch.int64)                        # -1 where not resident
         resident = valid & (cells >= 0)
+        # DBG-REMAP-MISS (capture-safe): accumulate sel/resident counts into GPU scalars via
+        # pure += (no host sync → legal inside cuda graph capture). Read once per cycle at the
+        # side-band boundary (see get_and_reset_remap_miss). Miss = sel - resident = selected
+        # locs dropped because lut<0. Gate OFF → skipped entirely.
+        if self._dbg_remap_miss:
+            self._remap_sel_acc += valid.sum()
+            self._remap_res_acc += resident.sum()
         # DBG block does host syncs (.sum()/.item()) — ILLEGAL inside cuda graph capture.
         # Phase-2 runs remap IN the captured decode forward, so guard the debug print to
         # only fire eager (capture-mode off). _maybe_capturing() is cheap + capture-safe.
@@ -1138,6 +1309,24 @@ class SwapEngineP:
                       f"full={self.full[compress_layer_id]}", flush=True)
         out = torch.where(resident, cells, torch.full_like(locs, -1))
         return out.to(compress_locs.device, dtype=compress_locs.dtype)
+
+    def get_and_reset_remap_miss(self):
+        """DBG-REMAP-MISS: D2H-read the accumulated (sel, resident) counts and reset to 0.
+        Called ONCE per cycle at the side-band boundary (out of graph → host sync legal).
+        Returns (sel, resident, miss=sel-resident) or None when the gate is off. miss>0 means
+        native-top-512 selected locs were dropped because their lut cell was <0 (failure mode 1:
+        remap漏命中/非全集). miss==0 with a wrong answer → failure mode 2 (byte mismatch)."""
+        if not self._dbg_remap_miss:
+            return None
+        sel = int(self._remap_sel_acc.item())
+        res = int(self._remap_res_acc.item())
+        dsf = int(self._ds_formed_acc.item())
+        dsv = int(self._ds_valid_acc.item())
+        self._remap_sel_acc.zero_()
+        self._remap_res_acc.zero_()
+        self._ds_formed_acc.zero_()
+        self._ds_valid_acc.zero_()
+        return sel, res, sel - res, dsf, dsv
 
     # ── point 3: decode new-token c4 chunk -> reserved cell (map_last_loc analog) ─
     def store_decode(self, compress_layer_id: int, out_loc: torch.Tensor, pack) -> None:
@@ -1192,7 +1381,7 @@ class SwapEngineP:
     @torch.no_grad()
     def store_decode_to_reserve(
         self, compress_layer_id: int, req_pool_indices: torch.Tensor,
-        c4_out_loc: torch.Tensor, pack
+        c4_out_loc: torch.Tensor, pack, seq_lens: torch.Tensor = None
     ) -> None:
         """IN-GRAPH-SAFE decode store (FIXED-SHAPE, NO host sync): unconditionally store ALL
         B rows every step (cuda graph requires fixed shape — no .nonzero()/.any() filter).
@@ -1215,7 +1404,15 @@ class SwapEngineP:
         ri_c = ri.clamp(0, self._max_req_pool - 1)
         pc = self._prefill_chunks_t[ri_c]            # [B] prefill chunk count, -1 if unknown
         slot = self._decode_slot_t[ri_c]             # [B] decode slot, -1 if unknown
-        local = loc - pc                             # [B] local decode chunk index
+        if self._localfix and seq_lens is not None:
+            # LOGICAL decode step: total c4 chunks so far (seq_lens//4) minus prefill chunks,
+            # minus 1 for 0-based index of the chunk JUST formed. Monotonic 0,1,2,… and bounded
+            # by the request's own decode progress → immune to physical-loc jumps on a reused
+            # req_pool_idx. (loc still used below for the lut KEY + `loc>0` new-chunk test.)
+            sl = seq_lens.to(self.device, dtype=torch.int64)
+            local = (sl // 4) - 1 - pc               # [B] logical local decode chunk index
+        else:
+            local = loc - pc                         # [B] local decode chunk index (physical, legacy)
         real_cell = self.decode_base + slot * self._decode_resident_chunks + local
         # valid: real new chunk this step (loc>0), known req (pc>=0, slot>=0), within span.
         valid = (loc > 0) & (pc >= 0) & (slot >= 0) & (local >= 0) \
@@ -1224,6 +1421,14 @@ class SwapEngineP:
         # unconditionally with no host-sync filter. Valid rows -> their deterministic cell.
         cell = torch.where(valid, real_cell, torch.full_like(real_cell, self.sink_cell))
         cell = cell.clamp(0, self.cell_capacity - 1).contiguous()
+        # DBG-DECODE-STORE (capture-safe): count decode chunks that FORMED this step (loc>0) vs
+        # those that actually stored VALID (into decode-region) vs funneled to SINK. If a decode
+        # chunk forms but goes to sink, its lut stays -1 → remap misses it later. += only (no
+        # host sync); read at side-band boundary. Localizes "decode chunks not stored".
+        if self._dbg_remap_miss:
+            _formed = (loc > 0)
+            self._ds_formed_acc += _formed.sum()
+            self._ds_valid_acc += (valid & _formed).sum()
         SetKAndS.execute(
             pool=self.pool,
             buf=self.reserve_buf[compress_layer_id],
@@ -1237,6 +1442,36 @@ class SwapEngineP:
             torch.full_like(loc, self.lut_sentinel_col),
         )
         self.chunk_cell_lut[compress_layer_id, lut_col] = cell.to(torch.int32)
+
+
+    def reset_recall_state(self) -> None:
+        """Wipe ALL cross-request recall-allocator state so a fresh request starts clean.
+
+        WHY: on the PD-decode server the prefill-side reset_req_residency (which normally
+        reclaims a finished request's cells) never fires, so `_g_page_to_block` / `_g_next_block`
+        / `_g_chunk_to_cell` / `next_cell` grow monotonically across requests and a new request
+        INHERITS the previous occupant's block map (confirmed via [DBG-REQ-ENTER]:
+        next_block=158 p2b=158 for the 2nd request on a fresh server). A stale block whose bytes
+        were never overwritten by this request's recall can then be read by the native top-512 →
+        cross-request KV contamination → non-determinism.
+
+        SAFETY: this is a GLOBAL wipe — correct ONLY when NO other request is mid-decode (i.e.
+        conc=1, or a barrier). At conc>1 it would nuke live requests' resident cells; the proper
+        production fix is per-request cell reclaim (release_req_pool_locs on finish). Gated by
+        SGLANG_PATHP_RESET_RECALL_PER_REQ; used first as a conc=1 root-cause probe."""
+        self._g_page_to_block.clear()
+        self._g_next_block = 0
+        self._g_free_blocks.clear()
+        self._g_chunk_to_cell.clear()
+        self._g_next_cell = 0
+        self._g_free_cells.clear()
+        if getattr(self, "_g_orphan_miss", None) is not None:
+            self._g_orphan_miss.clear()
+        self._g_full = False
+        for i in range(len(self.next_cell)):
+            self.next_cell[i] = 0
+        # lut back to all -1 (no chunk resident) — next recall re-materializes from mirror.
+        self.chunk_cell_lut.fill_(-1)
 
 
     # ── PD point: ingest P->D transferred c4 history into the CPU mirror ─────────
@@ -1342,6 +1577,36 @@ class SwapEngineP:
                         n_freed += 1
         # clear these locs in every layer's lut (not resident anymore until re-recalled).
         self.chunk_cell_lut[:, locs.to(self.device)] = -1
+        return n_freed
+
+    def release_owned_pages(self, req_pool_idx: int) -> int:
+        """OWNER-RELEASE: free EXACTLY the pages a finished request recalled (recorded in
+        _req_owned_pages at recall time). Precise identity — never touches a live request's
+        pages, unlike the buffer-row heuristic in _reset_changed_rows. For each owned page:
+        pop its page-block back to the free list + clear that page's 64 lut columns in every
+        layer (so a later req reusing that physical page sees lut<0 → re-recalls fresh bytes).
+        Called when a req_pool_idx vanishes from the decode batch (true finish). Out of graph.
+        Idempotent (unknown ri → 0). Only meaningful in page-recall + _owner_release."""
+        if not (self._owner_release and self._page_recall):
+            return 0
+        pages = self._req_owned_pages.pop(int(req_pool_idx), None)
+        if not pages:
+            return 0
+        ps = C4_PAGE_SIZE
+        p2b = self._g_page_to_block
+        cols_list = []
+        n_freed = 0
+        for pg in pages:
+            blk = p2b.pop(pg, None)
+            if blk is not None:
+                self._g_free_blocks.append(int(blk))
+                n_freed += 1
+            base = pg * ps
+            cols_list.append(torch.arange(base, base + ps, dtype=torch.int64))
+        if cols_list:
+            cols = torch.cat(cols_list)
+            cols = cols[(cols >= 0) & (cols < self.chunk_cell_lut.shape[1])]
+            self.chunk_cell_lut[:, cols.to(self.device)] = -1
         return n_freed
 
     def reclaim_orphans_global(self, resident_mask: torch.Tensor) -> int:

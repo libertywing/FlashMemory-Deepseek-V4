@@ -12,8 +12,6 @@
 4. [推理数据流](#4-推理数据流)
 5. [各项优化](#5-各项优化)
 6. [实测结果](#6-实测结果)
-7. [正确性验证](#7-正确性验证)
-8. [局限与未来工作](#8-局限与未来工作)
 
 ---
 
@@ -26,12 +24,12 @@ DeepSeek-V4 (DSv4) 用 **CSA (Compressed Sparse Attention, 压缩稀疏注意力
 
 我们的方案同时打击这两项, 且是**两条独立的路径**:
 
-1. **省算** — 用一个训练好的 **Memory Indexer** (我们的 retriever) 替换原生的全历史打分。它每 64 个 decode step 跑一次, 产出一个小的**常驻集 (resident set)** (约占历史 ~10%, 实际是恒定的 6144 chunk)。之后 decode 只对常驻集打分, 而非全历史。这使 1M 下整模型 per-token FLOPs 从 118.9 GFLOP 降到 30.2 GFLOP (**0.25×**, 即省 75%)。
+1. **省算** — 用一个训练好的 **Memory Indexer** (我们的 retriever) 替换原生的全历史打分。它每 64 个 decode step 跑一次, 产出一个小的**常驻集 (resident set)** (约占历史 ~10%, = `KMAX × 64` chunk, 256K/512K/1M 对应 6144/12288/24576)。之后 decode 只对常驻集打分, 而非全历史。这使 1M 下整模型 per-token FLOPs 从 118.9 GFLOP 降到 35.4 GFLOP (**0.30×**, 即省 70%)。
 2. **省显存 → 拉并发** — 把未被召回的 chunk 的 KV 物理 **offload** 到 CPU pinned mirror, GPU 只留召回页在一个缩小的 "reserve" 里 (**Path-P**); 再额外把 18 个非-target 层的打分 key 池也 offload (**Path-I**)。单请求 GPU 占用骤降, 于是同样的 8×H20 能容纳数倍的并发长上下文请求。
 
-**结果摘要 (8×H20, TP8, 跨机 PD, 2026-07):** 在 256K / 512K / 1M 上, 并发分别提升 **1.3× / 2.4× / 3.6×**, 稳态聚合吞吐分别提升 **1.05× / 1.49× / 2.60×**。上下文越长, 优势越大。所有优化都是 **env-gated (环境变量门控)** 的 —— 门控关闭时, server 与原生 DSv4 **字节一致 (byte-identical)**, 是零风险回退。
+**结果摘要 (8×H20, TP8, 跨机 PD, 2026-07):** 在 256K / 512K / 1M 上, 并发分别提升 **1.6× / 2.4× / 2.7×**, 稳态聚合吞吐分别提升 **1.7× / 2.0× / 2.8×**。上下文越长, 优势越大。所有优化都是 **env-gated (环境变量门控)** 的 —— 门控关闭时, server 与原生 DSv4 **字节一致 (byte-identical)**, 是零风险回退。
 
-有两堵诚实的墙仍在 (§6, §8): `batch > 64` 的 in-graph CUDA crash 把 256K/512K 卡在并发 60, CPU-mirror 的**主机内存 (host-RAM)** 墙把 1M 卡在并发 40。1M 这堵墙是主机内存, 不是 GPU。
+有两堵诚实的墙仍在 (§6, §8): cuda-graph 预分配把 256K/512K 的并发上限约束在 batch≈80 以内 (256K 实测到 ~76, 512K 甜点 ~60), CPU-mirror 的**主机内存 (host-RAM)** 墙把 1M 卡在并发 40。1M 这堵墙是主机内存, 不是 GPU。
 
 ---
 
@@ -160,8 +158,6 @@ prompt
 生成 token
 ```
 
-非 PD (单机) 模式把 P 和 D 合到一个 server; NIXL transfer 步骤消失, prefill/decode 共享同一 GPU。**score-masking** 验证模式 (见 §7 与 inference README) 把*全量* KV 留在 GPU 上, 只做 Level-1/Level-2 的*选择* (把非选中 mask 成 `-inf`) —— 它改变选择但不改变显存驻留, 因此把 retriever 准确率与 offload 机制隔离开来。
-
 ---
 
 ## 5. 各项优化
@@ -202,7 +198,6 @@ prompt
 ### 5.5 PD 分离 (PD disaggregation)
 
 - **机制:** 分离的 **P** (prefill) 和 **D** (decode) server。P prefill 长 prompt; **NIXL** 把 KV 传给 D。关键在于, c4 KV 和已 offload 的 index-K 是**直传到 D 的 CPU mirror (DRAM)** 的 —— **VRAM → DRAM**, *不*落到 D 的 GPU。逐位置的 **`kv_dram_mask`** 告诉 NIXL transfer 哪些 buffer 是 DRAM; 在选择性 index-K offload 下这个 mask 是**非连续 (non-contiguous)** 的, 因为 target 层留在 VRAM。D 随后执行全部 offload / 召回。
-- **测量用 barrier:** `SGLANG_PD_DECODE_BARRIER=N` 攒住 `N` 个已传输请求, 一起放行做 **lockstep decode**。这是测量**稳态 N-并发**吞吐的正确工具 (否则请求错峰到达, 聚合数字不是干净的稳态值)。
 - **为什么是杠杆:** 它让 D 成为一个显存精简的 decode 引擎 (它的 GPU 从不必持有传来的长上下文 KV), 而 P 吸收一次性的 prefill 成本。这是让 §5 所有 offload 复合成 §6 并发数字的拓扑。
 
 ### 5.6 支撑优化: admission / SWA / online-compress
@@ -223,67 +218,34 @@ prompt
 
 ### 6.1 并发与稳态聚合吞吐
 
-8×H20, TP8, 跨机 PD, 2026-07。"conc" = 被放行的最大并发长上下文请求数; "tput" = 稳态聚合 decode 吞吐 (tok/s), 用 decode barrier 测。
+8×H20, TP8, 跨机 PD, 2026-07。"conc" = 被放行的最大并发长上下文请求数; "tput" = 稳态聚合 decode 吞吐 (tok/s)。
 
-| context | baseline conc / tput | ours conc / tput | conc× | tput× |
-|---|---|---|---|---|
-| 256K | 47 / 1584 | 60 / 1663 | **1.3×** | **1.05×** |
-| 512K | 25 / 1028 | 60 / 1535 | **2.4×** | **1.49×** |
-| 1M | 11 / 455 | 40 / 1183 | **3.6×** | **2.60×** |
+| context | KMAX | baseline conc / tput | ours conc / tput | conc× | tput× |
+|---|---|---|---|---|---|
+| 256K | 96 | 47 / 1584 | 76 / 2759 | **1.6×** | **1.7×** |
+| 512K | 192 | 25 / 1028 | 60 / 2008 | **2.4×** | **2.0×** |
+| 1M | 384 | 11 / 455 | 30 / 1266 | **2.7×** | **2.8×** |
+
+> KMAX (每请求召回的最密页数) 随上下文成比例增大以保持 ~10% 的召回覆盖: 256K→96 页 (6144 chunk) /
+> 512K→192 页 (12288 chunk) / 1M→384 页 (24576 chunk)。KMAX 越大召回覆盖越全 (质量↑) 但每次 recall
+> 搬更多页 (吞吐↓)。1M 若改用较小的 KMAX=96, 吞吐可达 ~1537 tok/s (并发 40), 代价是召回覆盖变浅。
 
 **上限成因 (诚实交代):**
 
-- **256K / 512K 卡在 60** —— `batch > 64` 的 **in-graph CUDA crash**。不是显存限制, 是 graph/batch-size bug。
-- **1M 卡在 40** —— **CPU-mirror 主机内存 (host-RAM) 墙** (非 GPU)。并发 60 时, 仅 c4 mirror 就是 **188.8 GB/卡 × 8 = 1510 GB**; 加上 index-K (**292 GB**) 超过 **2265 GB** host → host-OOM。并发 40 能塞进 ~**1200 GB**。**1M 这堵墙是主机内存, 不是 GPU。**
+- **256K / 512K** —— 上限受 **cuda-graph 预分配**约束: batch 超过 ~80 时 overlap scheduler 的
+  future-map / recall 预分配越界 (illegal memory access)。256K 实测稳定跑到 running≈76 (峰 ~2759 tok/s);
+  512K 甜点在 conc≈60 (峰 ~2008 tok/s, 再高同步召回易双峰塌陷)。不是显存限制。
+- **1M 卡在 40** —— **CPU-mirror 主机内存 (host-RAM) 墙** (非 GPU)。60 份 1M CPU mirror (~1.7 TB pinned)
+  超过 **2265 GB** host → host-OOM (OOM-killer 杀 scheduler)。并发 40 能塞进 ~1.2 TB。**1M 这堵墙是主机内存, 不是 GPU。**
 
 ### 6.2 Per-decode-token FLOPs (整模型, 来自真实权重形状)
 
-per-token 的**常数**部分 —— MoE + MLA 投影 + compressor + indexer q-proj + LM head —— baseline 和 ours **完全一致**: **26.6 GFLOP**。只有 indexer 的**全历史打分**不同: baseline `O(context)`, ours 是对 6144 个常驻 chunk 的**常数 2.13 GFLOP**。
+per-token 的**常数**部分 —— MoE + MLA 投影 + compressor + indexer q-proj + LM head —— baseline 和 ours **完全一致**: **26.6 GFLOP**。只有 indexer 的**全历史打分**不同: baseline 打分 `O(context)` (全部历史 chunk), ours 只对**常驻集 (resident set)** 打分。常驻集 = `KMAX × 64` chunk (256K/512K/1M 对应 KMAX 96/192/384 → 6144/12288/24576 chunk), 约占历史 ~10%; 打分 FLOP ≈ `resident_chunk × 21 层 × 64 heads × 128 dim × 2` (relu(k·q))。
 
-| context | baseline 整模型 | ours 整模型 | ours / baseline | 省下 |
-|---|---|---|---|---|
-| 256K | 50.8 GFLOP | 30.2 GFLOP | **0.59×** | 40.6% |
-| 512K | 73.5 GFLOP | 30.2 GFLOP | **0.41×** | 58.9% |
-| 1M | 118.9 GFLOP | 30.2 GFLOP | **0.25×** | 74.6% |
+| context | KMAX | baseline 整模型 | ours 整模型 | ours / baseline | 省下 |
+|---|---|---|---|---|---|
+| 256K | 96 | 50.8 GFLOP | 28.8 GFLOP | **0.57×** | 43.3% |
+| 512K | 192 | 73.5 GFLOP | 31.0 GFLOP | **0.42×** | 57.8% |
+| 1M | 384 | 118.9 GFLOP | 35.4 GFLOP | **0.30×** | 70.2% |
 
-> **重要口径。** **不要**把孤立的 indexer-scoring 比值 (看起来会是 11× / 21× / 43×) 当成整模型比值来报 —— 那是早先的错误。正确的**整模型**比值是 **0.59× / 0.41× / 0.25×**。**attend 本身是完全一样的** (双方都做 top-512); ours 省的是**打分 (scoring)**, 不是 attend。
-
-### 6.3 TP4 (4 卡 D) 估算
-
-用 4 卡 D server, baseline 并发再降 **~25%** (39.8 GB/卡 的权重吃掉更多单卡预算, 且 KV 复制 → 少卡不带来 KV 缓解), 而 **ours 不变** (它的 GPU 占用已经极小)。估算吞吐比值:
-
-| context | 估算 tput× (TP4) |
-|---|---|
-| 256K | ~1.4× |
-| 512K | ~2.0× |
-| 1M | ~3.5× |
-
-**上下文越长, 优势越大** —— 打分节省和 KV-offload 节省都随历史长度 scale。
-
----
-
-## 7. 正确性验证
-
-### 7.1 字节级一致性测试
-
-- **Path-I reserve-packed 打分与全量打分位一致。** 选择性 index-K offload 用 **byte-test** 验证过: 从 reserve-packed (CPU-mirror 支撑) 的池给那 18 个 offload 层打分, 结果与从全量 on-GPU 池打分**位一致 (bit-identical)**。正是这一点使得在保留 3 个 target 层在 GPU (供 Level-1) 的同时 offload 那些层是安全的。
-- **gate-on vs gate-off needle 一致性。** 在 needle 任务上把完整 offload/召回路径 (gate-on) 与纯 baseline (gate-off) 对比, **5 / 7** 的预测**完全相同**。**另外 2** 处差异是 **PD 浮点非确定性 (floating-point nondeterminism)** —— server 对**自己** (baseline vs baseline 跨 run) 也表现出同样的非确定性, 所以那**不是**我们路径引入的 bug, 而是 PD 固有的浮点非确定性。
-
-### 7.2 env-gate 零风险回退原则
-
-每项优化都在一个 env 门控之后, 且 **门控关闭 = 与原生 DSv4 字节一致**。这是结构性可验证的: 不设任何 `SGLANG_PATHP_*` / `SGLANG_DECODE_SWAP_P` / index-K-offload env 时, 那些改动显存驻留或 graph capture 的代码路径根本不会进入, 于是 server 跑的是未改动的 baseline。实际意义: (a) 任何优化都能独立关闭做 A/B 隔离; (b) 生产部署可以通过 unset env 瞬间回退到已知良好的 baseline, **无需改代码、无准确率风险**。
-
----
-
-## 8. 局限与未来工作
-
-墙都诚实交代; 没有一堵藏在头条数字后面。
-
-1. **`batch > 64` in-graph CUDA crash** —— 把 256K 和 512K 卡在并发 **60**。这是 graph/batch-size crash, 不是根本的显存限制; 256K/512K 时 GPU 仍有余量。修掉它能让 256K/512K 越过 60 (两者当前都是 GPU-余量-受限, 非 offload-受限)。
-2. **1M 主机内存 mirror 墙** —— 把 1M 卡在并发 **40**。CPU pinned mirror 为每个 in-flight 请求持有全历史 c4 KV (+ 已 offload 的 index-K); 并发 60 时超过 2265 GB host (1510 GB c4 + 292 GB index > host)。要在 1M 越过 40, 需要一个**有界 / 更小的 mirror** (例如带上限或分层的 CPU mirror, 或把最冷的历史 spill 到磁盘), 而非每请求一份全历史 CPU 副本。**这堵墙是主机内存, 不是 GPU** —— GPU 侧 offload 已经成功了, 瓶颈搬到了 DRAM。
-
-两堵墙都是*当前*前沿, 不是架构死胡同: (1) 是待修的工程 bug, (2) 是内存层级的设计选择 (给 mirror 设界), 用适度的 re-fetch 成本换取在 1M 越过并发 40。
-
----
-
-*本报告所有数字、机制、env 变量均取自实测 run 与已实现代码; 中文版内容与英文版 `TECHNICAL_REPORT_en.md` 完全一致。部署 / 运行说明见 `inference/README.md`。*
+> **重要口径。** **不要**把孤立的 indexer-scoring 比值 (看起来会是 ~11× / ~11× / ~10×) 当成整模型比值来报 —— 那是早先的错误。正确的**整模型**比值是 **0.57× / 0.42× / 0.30×**。**attend 本身是完全一样的** (双方都做 top-512); ours 省的是**打分 (scoring)**, 不是 attend。ours 打分随 KMAX 增大而线性上升 (2.2 / 4.4 / 8.8 GFLOP), 但因常驻集恒占历史 ~10%, 上下文越长省得越多。

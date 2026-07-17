@@ -668,7 +668,39 @@ class ModelRunnerKVCacheMixin:
                 # SEPARATE reserve buffer (disjoint from the c4_kv_pool landing area),
                 # so PD transfer (lands in c4_kv_pool) and decode recall (writes the
                 # reserve) never collide. 0 = legacy single-pool (share c4_kv_pool).
+                #
+                # PROPORTIONAL AUTO-SIZE (SGLANG_PATHP_PAGE_KMAX_RATIO>0): the reserve must hold
+                # the recall LRU region (KMAX pages x concurrency, shared) PLUS the decode-resident
+                # tail region (DECODE_RESIDENT_CHUNKS x DECODE_MAX_CONC) PLUS headroom. When KMAX
+                # is ratio-derived we auto-size the reserve to fit it (else a fixed PD_RESERVE that
+                # was tuned for KMAX=96 would be too small for a larger ratio-KMAX → recall LRU
+                # thrash / wrong KV). Manual SGLANG_PD_RESERVE_TOKENS still wins if it is LARGER
+                # (never shrink below what the operator asked). Formula must match _resolve_page_kmax.
                 _reserve_tok = int(os.environ.get("SGLANG_PD_RESERVE_TOKENS", "0"))
+                _kmax_ratio = float(os.environ.get("SGLANG_PATHP_PAGE_KMAX_RATIO", "0") or "0")
+                if _kmax_ratio > 0:
+                    from sglang.srt.layers.attention.compressed.resident_mask_capturer import (
+                        _resolve_page_kmax,
+                    )
+                    _kmax = _resolve_page_kmax(_c4_page_size)
+                    _tgt_conc = int(os.environ.get("SGLANG_DSV4_TARGET_CONCURRENCY", "0")) or int(
+                        os.environ.get("SGLANG_PATHP_DECODE_MAX_CONC", "64")
+                    )
+                    _dec_chunks = int(os.environ.get("SGLANG_PATHP_DECODE_RESIDENT_CHUNKS", "2048"))
+                    _dec_conc = int(os.environ.get("SGLANG_PATHP_DECODE_MAX_CONC", "64"))
+                    # recall region (chunks) = KMAX*page*conc ; decode region = dec_chunks*dec_conc ;
+                    # +2 pages slack. All in CHUNKS → tokens = chunks*4 for the PD_RESERVE_TOKENS knob.
+                    _recall_chunks = _kmax * _c4_page_size * _tgt_conc
+                    _decode_chunks = _dec_chunks * _dec_conc
+                    _auto_chunks = _recall_chunks + _decode_chunks + 2 * _c4_page_size
+                    _auto_tok = _auto_chunks * 4
+                    if _auto_tok > _reserve_tok:
+                        logger.info(
+                            f"[Path-P] reserve AUTO-SIZE (KMAX_RATIO={_kmax_ratio:.3f}): KMAX={_kmax} "
+                            f"x conc={_tgt_conc} recall={_recall_chunks} + decode={_decode_chunks} "
+                            f"chunks -> reserve {_auto_tok} tok (was PD_RESERVE_TOKENS={_reserve_tok})"
+                        )
+                        _reserve_tok = _auto_tok
                 _reserve_pages = (
                     (_reserve_tok + _c4_page_size - 1) // _c4_page_size
                     if _reserve_tok > 0
