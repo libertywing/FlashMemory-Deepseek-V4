@@ -50,3 +50,4 @@ eval/
 *.log
 *.tmp
 paper_additions/
+CHANGES.md

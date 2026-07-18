@@ -6,7 +6,7 @@ scoring the full history every decode step, it predicts which ~10–15% of chunk
 64 tokens will attend to. Only the selected chunks stay on GPU; the rest are offloaded to
 CPU.
 
-**[Model weights on Hugging Face](https://huggingface.co/libertywing/FlashMemory-Deepseek-V4)**
+**[📄 Paper (arXiv:2606.09079)](https://arxiv.org/abs/2606.09079)** &nbsp;|&nbsp; **[Model weights on Hugging Face](https://huggingface.co/libertywing/FlashMemory-Deepseek-V4)** &nbsp;|&nbsp; **[Code on GitHub](https://github.com/libertywing/FlashMemory-Deepseek-V4)**
 
 ## Highlights
 
@@ -319,6 +319,6 @@ If you use FlashMemory in your research, please cite:
              Yujiu Yang and Haitao Mi and Dong Yu},
   year    = {2026},
   journal = {arXiv preprint arXiv:2606.09079},
-  url     = {https://huggingface.co/papers/2606.09079},
+  url     = {https://arxiv.org/abs/2606.09079},
 }
 ```
